@@ -1,0 +1,11 @@
+{
+  "name": "ledgerly-portfolio",
+  "private": true,
+  "version": "2.0.0",
+  "workspaces": ["client"],
+  "scripts": {
+    "dev": "npm run dev --workspace client",
+    "build": "npm run build --workspace client",
+    "preview": "npm run preview --workspace client"
+  }
+}
