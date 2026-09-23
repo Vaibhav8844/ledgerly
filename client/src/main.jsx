@@ -22,15 +22,27 @@ function parseMutualFundRows(rows){
  const required=['schemeName','units','invested','value']; if(required.some(key=>indexes[key]===undefined))throw new Error('Required headers: Scheme Name, Units, Invested Value and Current Value.');
  return rows.slice(1).map(row=>Object.fromEntries(Object.entries(indexes).map(([key,index])=>[key,['units','invested','value','returns','xirr'].includes(key)?parseNumber(row[index]):String(row[index]||'').trim()]))).filter(row=>row.schemeName);
 }
+function parseStockRows(rows){
+ if(rows.length<2)throw new Error('The file must contain a header row and at least one stock.');
+ const normalize=(value)=>String(value).toLowerCase().replace(/[.\-_/&]/g,'').replace(/\s+/g,'');
+ const headers=rows[0].map(normalize); const aliases={stockname:'symbol',isin:'isin',quantity:'qty',averagebuyprice:'avg',buyvalue:'invested',closingprice:'ltp',closingvalue:'value',unrealisedpl:'pnl',unrealizedpl:'pnl'};
+ const indexes={}; headers.forEach((header,index)=>{if(aliases[header])indexes[aliases[header]]=index;});
+ const required=['symbol','qty','invested','ltp','value']; if(required.some(key=>indexes[key]===undefined))throw new Error('Required headers: Stock Name, Quantity, Buy value, Closing price and Closing value.');
+ return rows.slice(1).map(row=>Object.fromEntries(Object.entries(indexes).map(([key,index])=>[key,['qty','avg','invested','ltp','value','pnl'].includes(key)?parseNumber(row[index]):String(row[index]||'').trim()]))).filter(row=>row.symbol);
+}
+function parseImportRows(rows){
+ const headers=rows[0].map(value=>String(value).toLowerCase());
+ return headers.some(value=>value.includes('stock name')||value.includes('isin'))?{kind:'stocks',rows:parseStockRows(rows)}:{kind:'mutualFunds',rows:parseMutualFundRows(rows)};
+}
 function parseMutualFundFile(text){return parseMutualFundRows(parseDelimited(text));}
 async function parseMutualFundUpload(file){
  if(file.name.toLowerCase().endsWith('.xlsx')){
   const workbook=XLSX.read(await file.arrayBuffer(),{type:'array'});
   const sheetName=workbook.SheetNames[0];
   if(!sheetName)throw new Error('The Excel workbook has no worksheets.');
-  return parseMutualFundRows(XLSX.utils.sheet_to_json(workbook.Sheets[sheetName],{header:1,defval:''}));
+  return parseImportRows(XLSX.utils.sheet_to_json(workbook.Sheets[sheetName],{header:1,defval:''}));
  }
- return parseMutualFundFile(await file.text());
+ return parseImportRows(parseDelimited(await file.text()));
 }
 
 function App(){
@@ -46,7 +58,7 @@ function App(){
  return <div className="app">
   <aside className={`sidebar ${mobileOpen?'open':''}`}><div className="brand"><div className="brandmark">L</div><div><b>Ledgerly</b><span>Portfolio</span></div></div>{nav.map(([id,label,Icon])=><button key={id} className={`nav ${tab===id?'active':''}`} onClick={()=>{setTab(id);setMobileOpen(false)}}><Icon size={19}/>{label}</button>)}<div className="side-bottom"><div className="secure"><CircleDollarSign size={18}/><div><b>Private by design</b><span>Data stored in Google Sheets</span></div></div></div></aside>
   {mobileOpen&&<div className="scrim" onClick={()=>setMobileOpen(false)}/>} 
-    <main className="main"><header><button className="mobile-menu" onClick={()=>setMobileOpen(true)}><Menu/></button><div><span className="eyebrow">PERSONAL WEALTH</span><h1>{tab==='dashboard'?'Portfolio overview':tab[0].toUpperCase()+tab.slice(1)}</h1></div><div className="header-actions"><MarketBadge market={data.market}/><button className="icon-btn" title="Refresh prices" onClick={refreshQuotes} disabled={refreshing}><RefreshCw size={18} className={refreshing?'spin':''}/></button><label className="secondary import-button" title="Import mutual fund Excel, CSV or TSV"><Upload size={17}/> Import MF<input type="file" accept=".xlsx,.csv,.tsv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv,text/tab-separated-values" onChange={async e=>{const file=e.target.files?.[0];if(!file)return;try{const rows=await parseMutualFundUpload(file);const r=await fetch(API,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({action:'importMutualFunds',rows})});const next=await r.json();if(!r.ok||next.ok===false)throw new Error(next.error||'Import failed');await load();alert(`Imported ${next.count} mutual fund rows.`);}catch(error){alert(error.message||'Could not import mutual funds.')}e.target.value='';}}/></label><button className="primary" onClick={()=>setModal(true)}><Plus size={18}/> Add transaction</button></div></header>
+    <main className="main"><header><button className="mobile-menu" onClick={()=>setMobileOpen(true)}><Menu/></button><div><span className="eyebrow">PERSONAL WEALTH</span><h1>{tab==='dashboard'?'Portfolio overview':tab[0].toUpperCase()+tab.slice(1)}</h1></div><div className="header-actions"><MarketBadge market={data.market}/><button className="icon-btn" title="Refresh prices" onClick={refreshQuotes} disabled={refreshing}><RefreshCw size={18} className={refreshing?'spin':''}/></button><label className="secondary import-button" title="Import stock or mutual-fund Excel, CSV or TSV"><Upload size={17}/><span>Import data</span><input type="file" accept=".xlsx,.csv,.tsv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv,text/tab-separated-values" onChange={async e=>{const file=e.target.files?.[0];if(!file)return;try{const imported=await parseMutualFundUpload(file);const r=await fetch(API,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({action:'importData',kind:imported.kind,rows:imported.rows})});const next=await r.json();if(!r.ok||next.ok===false)throw new Error(next.error||'Import failed');await load();alert(`Imported ${next.count} ${imported.kind==='stocks'?'stock':'mutual fund'} rows.`);}catch(error){alert(error.message||'Could not import data.')}e.target.value='';}}/></label><button className="primary" onClick={()=>setModal(true)}><Plus size={18}/> Add transaction</button></div></header>
    {tab==='dashboard'&&<Dashboard totals={totals} holdings={holdings} snapshots={data.snapshots||[]} market={data.market} quotes={data.quotes}/>} {tab==='holdings'&&<Holdings holdings={holdings}/>} {tab==='transactions'&&<Transactions txs={data.transactions||[]} onRefresh={load}/>} {tab==='analytics'&&<Analytics holdings={holdings} totals={totals}/>} {tab==='settings'&&<SettingsPage onRefresh={load}/>} 
   </main>
   {modal&&<TransactionModal onClose={()=>setModal(false)} onSaved={()=>{setModal(false);load();refreshQuotes()}}/>}

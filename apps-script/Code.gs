@@ -5,10 +5,11 @@
 
 const SHEETS = {
   transactions: 'Transactions', quotes: 'Quotes', snapshots: 'Snapshots', lots: 'Lots',
-  settings: 'Settings', holidays: 'MarketHolidays', mutualFunds: 'MutualFunds'
+  settings: 'Settings', holidays: 'MarketHolidays', mutualFunds: 'MutualFunds', stocks: 'ImportedStocks'
 };
 
 const MUTUAL_FUND_HEADERS = ['Scheme Name','AMC','Category','Sub-category','Folio No.','Source','Units','Invested Value','Current Value','Returns','XIRR'];
+const STOCK_HEADERS = ['Stock Name','ISIN','Quantity','Average buy price','Buy value','Closing price','Closing value','Unrealised P&L'];
 
 function setupLedgerlySheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -19,6 +20,7 @@ function setupLedgerlySheet() {
   ensureSheet_(ss, SHEETS.settings, ['Key','Value']);
   ensureSheet_(ss, SHEETS.holidays, ['Date','Description']);
   ensureSheet_(ss, SHEETS.mutualFunds, MUTUAL_FUND_HEADERS);
+  ensureSheet_(ss, SHEETS.stocks, STOCK_HEADERS);
   const settings = ss.getSheetByName(SHEETS.settings);
   if (settings.getLastRow() === 1) settings.getRange(2,1,4,2).setValues([
     ['Accounting Method','FIFO'], ['Currency','INR'], ['Price Source','GoogleFinance / NSE'], ['Created','Ledgerly Portfolio']
@@ -51,6 +53,7 @@ function handle_(e, method) {
     else if (action === 'quote') result = upsertQuote_(body);
     else if (action === 'snapshot') result = saveSnapshot_(body);
     else if (action === 'importMutualFunds') result = importMutualFunds_(body.rows || []);
+    else if (action === 'importData') result = importData_(body.kind, body.rows || []);
     else if (action === 'setup') result = setupLedgerlySheet();
     else throw new Error('Unknown action: ' + action);
     return json_(result, params.callback || body.callback);
@@ -71,11 +74,12 @@ function getPortfolio_() {
   const snapshots = readSnapshots_();
   const calc = calculate_(transactions, quotes);
   const mutualFunds = readMutualFunds_();
-  const holdings = calc.holdings.concat(mutualFunds.map(mutualFundHolding_)).sort((a,b)=>b.value-a.value);
+  const importedStocks = readImportedStocks_();
+  const holdings = calc.holdings.concat(mutualFunds.map(mutualFundHolding_), importedStocks.map(importedStockHolding_)).sort((a,b)=>b.value-a.value);
   const invested = holdings.reduce((s,h) => s + h.invested, 0);
   const value = holdings.reduce((s,h) => s + h.value, 0);
   const todayPnl = holdings.reduce((s,h) => s + (h.dayPnl || 0), 0);
-  return {ok:true, transactions, quotes, snapshots, mutualFunds, holdings, lots:calc.lots,
+  return {ok:true, transactions, quotes, snapshots, mutualFunds, importedStocks, holdings, lots:calc.lots,
     totals:{invested,value,pnl:value-invested,returnPct:invested ? (value-invested)/invested*100 : 0,realized:calc.realized,todayPnl},
     market:getMarketStatus_()};
 }
@@ -160,7 +164,19 @@ function readQuotes_(){
 function readSnapshots_(){const sh=SpreadsheetApp.getActive().getSheetByName(SHEETS.snapshots);if(!sh||sh.getLastRow()<2)return [];return sh.getRange(2,1,sh.getLastRow()-1,4).getValues().filter(r=>r[0]).map(r=>({date:formatDate_(r[0]),value:Number(r[1]),invested:Number(r[2]),pnl:Number(r[3])}));}
 function readLots_(){const sh=SpreadsheetApp.getActive().getSheetByName(SHEETS.lots);if(!sh||sh.getLastRow()<2)return [];return sh.getRange(2,1,sh.getLastRow()-1,9).getValues().filter(r=>r[0]).map(r=>({lotId:String(r[0]),transactionId:String(r[1]),symbol:String(r[2]),buyDate:formatDate_(r[3]),originalQty:Number(r[4]),remainingQty:Number(r[5]),buyPrice:Number(r[6]),cost:Number(r[7]),status:String(r[8])}));}
 function readMutualFunds_(){const sh=SpreadsheetApp.getActive().getSheetByName(SHEETS.mutualFunds);if(!sh||sh.getLastRow()<2)return [];return sh.getRange(2,1,sh.getLastRow()-1,MUTUAL_FUND_HEADERS.length).getValues().filter(r=>r[0]).map(r=>({schemeName:String(r[0]),amc:String(r[1]||''),category:String(r[2]||''),subCategory:String(r[3]||''),folioNo:String(r[4]||''),source:String(r[5]||''),units:Number(r[6])||0,invested:Number(r[7])||0,value:Number(r[8])||0,returns:Number(r[9])||0,xirr:Number(r[10])||0}));}
+function readImportedStocks_(){const sh=SpreadsheetApp.getActive().getSheetByName(SHEETS.stocks);if(!sh||sh.getLastRow()<2)return [];return sh.getRange(2,1,sh.getLastRow()-1,STOCK_HEADERS.length).getValues().filter(r=>r[0]).map(r=>({symbol:String(r[0]),isin:String(r[1]||''),qty:Number(r[2])||0,avg:Number(r[3])||0,invested:Number(r[4])||0,ltp:Number(r[5])||0,value:Number(r[6])||0,pnl:Number(r[7])||0}));}
 function mutualFundHolding_(fund){const symbol=fund.schemeName||fund.folioNo||'Mutual fund';const qty=fund.units;const avg=qty?fund.invested/qty:0;const ltp=qty?fund.value/qty:0;const pnl=fund.value-fund.invested;return {symbol,displayName:fund.schemeName,qty,invested:fund.invested,value:fund.value,pnl,returnPct:fund.invested?pnl/fund.invested*100:0,avg,ltp,previousClose:0,dayPnl:0,assetType:'MF',lots:[],mutualFund:fund};}
+function importedStockHolding_(stock){const pnl=stock.value-stock.invested;return {symbol:stock.symbol,displayName:stock.symbol,qty:stock.qty,invested:stock.invested,value:stock.value,pnl,returnPct:stock.invested?pnl/stock.invested*100:0,avg:stock.avg||0,ltp:stock.ltp,previousClose:0,dayPnl:0,assetType:'STOCK',lots:[],importedStock:stock};}
+function importData_(kind, rows){if(kind==='stocks')return importStocks_(rows);if(kind==='mutualFunds')return importMutualFunds_(rows);throw new Error('Unsupported import type.');}
+function importStocks_(rows){
+  if(!Array.isArray(rows))throw new Error('Stock rows must be an array.');
+  const ss=SpreadsheetApp.getActive(),sh=ensureSheet_(ss,SHEETS.stocks,STOCK_HEADERS);
+  const clean=rows.filter(r=>r&&String(r.symbol||'').trim()).map(r=>STOCK_HEADERS.map((_,i)=>[r.symbol,r.isin,r.qty,r.avg,r.invested,r.ltp,r.value,r.pnl][i]));
+  if(!clean.length)throw new Error('No stock rows found. Check the header names and data.');
+  if(sh.getLastRow()>1)sh.getRange(2,1,sh.getLastRow()-1,STOCK_HEADERS.length).clearContent();
+  sh.getRange(2,1,clean.length,STOCK_HEADERS.length).setValues(clean);
+  return {ok:true,count:clean.length,stocks:readImportedStocks_()};
+}
 function importMutualFunds_(rows){
   if(!Array.isArray(rows))throw new Error('Mutual fund rows must be an array.');
   const sh=SpreadsheetApp.getActive().getSheetByName(SHEETS.mutualFunds)||SpreadsheetApp.getActive().insertSheet(SHEETS.mutualFunds);
