@@ -54,6 +54,7 @@ function handle_(e, method) {
     else if (action === 'snapshot') result = saveSnapshot_(body);
     else if (action === 'importMutualFunds') result = importMutualFunds_(body.rows || []);
     else if (action === 'importData') result = importData_(body.kind, body.rows || []);
+    else if (action === 'updateHolding') result = updateHolding_(body);
     else if (action === 'setup') result = setupLedgerlySheet();
     else throw new Error('Unknown action: ' + action);
     return json_(result, params.callback || body.callback);
@@ -168,6 +169,20 @@ function readImportedStocks_(){const sh=SpreadsheetApp.getActive().getSheetByNam
 function mutualFundHolding_(fund){const symbol=fund.schemeName||fund.folioNo||'Mutual fund';const qty=fund.units;const avg=qty?fund.invested/qty:0;const ltp=qty?fund.value/qty:0;const pnl=fund.value-fund.invested;return {symbol,displayName:fund.schemeName,qty,invested:fund.invested,value:fund.value,pnl,returnPct:fund.invested?pnl/fund.invested*100:0,avg,ltp,previousClose:0,dayPnl:0,assetType:'MF',lots:[],mutualFund:fund};}
 function importedStockHolding_(stock){const pnl=stock.value-stock.invested;return {symbol:stock.symbol,displayName:stock.symbol,qty:stock.qty,invested:stock.invested,value:stock.value,pnl,returnPct:stock.invested?pnl/stock.invested*100:0,avg:stock.avg||0,ltp:stock.ltp,previousClose:0,dayPnl:0,assetType:'STOCK',lots:[],importedStock:stock};}
 function importData_(kind, rows){if(kind==='stocks')return importStocks_(rows);if(kind==='mutualFunds')return importMutualFunds_(rows);throw new Error('Unsupported import type.');}
+function updateHolding_(input){
+  const kind=String(input.kind||'');
+  if(kind==='stocks'){
+    const sh=SpreadsheetApp.getActive().getSheetByName(SHEETS.stocks), values=sh&&sh.getDataRange().getValues();
+    if(!sh||!input.symbol)throw new Error('Stock holding not found.');
+    for(let row=1;row<values.length;row++)if(String(values[row][0])===String(input.symbol)){sh.getRange(row+1,1,1,STOCK_HEADERS.length).setValues([[String(input.symbol),String(input.isin||''),Number(input.qty)||0,Number(input.avg)||0,Number(input.invested)||0,Number(input.ltp)||0,Number(input.value)||0,Number(input.value||0)-Number(input.invested||0)]]);return {ok:true};}
+  }
+  if(kind==='mutualFunds'){
+    const sh=SpreadsheetApp.getActive().getSheetByName(SHEETS.mutualFunds), values=sh&&sh.getDataRange().getValues();
+    if(!sh||!input.schemeName)throw new Error('Mutual-fund holding not found.');
+    for(let row=1;row<values.length;row++)if(String(values[row][0])===String(input.schemeName)&&String(values[row][4]||'')===String(input.folioNo||'')){sh.getRange(row+1,1,1,MUTUAL_FUND_HEADERS.length).setValues([[String(input.schemeName),String(input.amc||''),String(input.category||''),String(input.subCategory||''),String(input.folioNo||''),String(input.source||''),Number(input.units)||0,Number(input.invested)||0,Number(input.value)||0,Number(input.value||0)-Number(input.invested||0),Number(input.xirr)||0]]);return {ok:true};}
+  }
+  throw new Error('Holding not found or cannot be edited.');
+}
 function importStocks_(rows){
   if(!Array.isArray(rows))throw new Error('Stock rows must be an array.');
   const ss=SpreadsheetApp.getActive(),sh=ensureSheet_(ss,SHEETS.stocks,STOCK_HEADERS);
