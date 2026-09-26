@@ -15,6 +15,7 @@ import * as XLSX from 'xlsx';
 import './styles.css';
 
 const API=(import.meta.env.VITE_API_URL||'').replace(/\/$/,'');
+console.log('LEDGERLY API URL:', API);
 const money=(n)=>new Intl.NumberFormat('en-IN',{style:'currency',currency:'INR',maximumFractionDigits:0}).format(Number(n||0));
 const moneyCompact=(n)=>{
   const v=Number(n||0);
@@ -27,9 +28,33 @@ const pct=(n)=>`${Number(n||0)>=0?'+':''}${Number(n||0).toFixed(2)}%`;
 const parseNumber=(value)=>Number(String(value??'').replace(/[₹,%]/g,'').replace(/,/g,'').trim())||0;
 const safeArray=(v)=>Array.isArray(v)?v:[];
 const safeFinance=(v)=>v&&typeof v==='object'?v:{};
-const accountName=(account)=>String(account?.name||account?.accountName||account?.bankName||account?.displayName||'Unnamed account').trim();
-function cachedPortfolio(period){try{const raw=localStorage.getItem('ledgerly:lastPortfolio');if(!raw)return null;const x=JSON.parse(raw);return x?.period===period?x.data:null}catch(_){return null}}
-function cachePortfolio(period,data){try{localStorage.setItem('ledgerly:lastPortfolio',JSON.stringify({period,data,savedAt:Date.now()}))}catch(_){}}
+const accountName=(account)=>String(account?.account||account?.name||account?.accountName||account?.bankName||account?.displayName||'Unnamed account').trim();
+const amountFrom=(item,keys)=>{for(const key of keys){if(item?.[key]!==undefined&&item?.[key]!==null&&item?.[key]!=='')return Number(item[key])||0;}return 0;};
+function normalizeMonthlyRows(finance){
+  const source=safeArray(finance.monthly||finance.monthlyBreakdown||finance.monthlyCashFlow||finance.cashFlow||finance.monthlyTrend);
+  if(source.length)return source.map(row=>({month:String(row.month||row.period||row.monthName||row.label||'—'),income:amountFrom(row,['income','totalIncome','incomeAmount','credits']),spending:amountFrom(row,['spending','expenses','expense','totalExpenses','expenseAmount','debits']),investments:amountFrom(row,['investments','investment','totalInvestments','investmentAmount'])}));
+  const transactions=safeArray(finance.financeTransactions||finance.transactions||finance.recentTransactions), grouped={};
+  transactions.forEach(transaction=>{
+    const match=String(transaction.date||transaction.transactionDate||'').match(/^(\d{4})[-/]?(\d{2})/); if(!match)return;
+    const month=`${match[1]}-${match[2]}`, type=String(transaction.type||transaction.transactionType||'').toLowerCase(), amount=Math.abs(amountFrom(transaction,['amount','total','value']));
+    const row=grouped[month]||{month,income:0,spending:0,investments:0};
+    if(type==='income')row.income+=amount; else if(type==='investment')row.investments+=amount; else row.spending+=amount;
+    grouped[month]=row;
+  });
+  return Object.values(grouped).sort((a,b)=>b.month.localeCompare(a.month));
+}
+function cachedPortfolio_(period){
+  try{
+    const raw=localStorage.getItem('ledgerly:lastPortfolio');
+    if(!raw)return null;
+    const parsed=JSON.parse(raw);
+    if(parsed?.period && parsed.period!==period)return null;
+    return parsed?.data||null;
+  }catch(_){return null}
+}
+function cachePortfolio_(period,value){
+  try{localStorage.setItem('ledgerly:lastPortfolio',JSON.stringify({period,data:value,savedAt:Date.now()}));}catch(_){}
+}
 const periodLabels={all:'All time','this-month':'This month','last-month':'Last month','last-3-months':'Last 3 months','last-6-months':'Last 6 months','this-year':'This year'};
 
 function parseDelimited(text){
@@ -133,9 +158,10 @@ async function parseMutualFundUpload(file){
 }
 
 function App(){
-  const [tab,setTab]=useState('dashboard');
+  const [tab,setTab]=useState(()=>sessionStorage.getItem('ledgerly.activeTab')||'dashboard');
   const [period,setPeriod]=useState('this-month');
-  const [data,setData]=useState({
+  const cached=cachedPortfolio_(period);
+  const [data,setData]=useState(cached||{
     transactions:[],quotes:{},snapshots:[],holdings:[],
     totals:{invested:0,value:0,pnl:0,returnPct:0,realized:0,todayPnl:0},
     market:{open:false,label:'Market closed'},finance:null
@@ -143,43 +169,60 @@ function App(){
   const [modal,setModal]=useState(false);
   const [editHolding,setEditHolding]=useState(null);
   const [editAccount,setEditAccount]=useState(null);
-  const [loading,setLoading]=useState(true);
+  const [loading,setLoading]=useState(!cached);
   const [refreshing,setRefreshing]=useState(false);
   const [mobileOpen,setMobileOpen]=useState(false);
   const [error,setError]=useState('');
 
-  const load=async({silent=false}={})=>{
-    const existing=!!(data.holdings?.length||data.finance||data.bankAccounts?.length);
-    if(!silent&&!existing)setLoading(true); else if(!silent)setRefreshing(true);
+  const hasUsableData=()=>!!(data&&(data.holdings?.length||data.finance||data.bankAccounts?.length));
+
+  const load=async()=>{
+    const hasData=hasUsableData();
+    if(!hasData)setLoading(true);
     setError('');
     try{
-      const r=await fetch(`${API}?action=portfolio&period=${encodeURIComponent(period)}`,{cache:'no-store'});
-      if(!r.ok)throw new Error(`Ledgerly API returned ${r.status}`);
+      const r=await fetch(`${API}?action=portfolio&period=${encodeURIComponent(period)}`);
+      if(!r.ok)throw new Error(r.status===404?'Ledgerly Apps Script deployment was not found. Deploy the current Code.gs as a web app and update client/.env with its /exec URL.':`Ledgerly API returned ${r.status}`);
       const next=await r.json();
       if(next.success===false||next.ok===false)throw new Error(next.error||next.message||'Could not load portfolio.');
-      setData(next);cachePortfolio(period,next);
-    }catch(e){console.error(e);setError(e.message||'Could not load Ledgerly.')}
-    finally{if(!silent&&!existing)setLoading(false);else if(!silent)setRefreshing(false)}
+      setData(next);
+      cachePortfolio_(period,next);
+    }catch(e){
+      console.error(e);
+      setError(e.message||'Could not load Ledgerly.');
+    }finally{
+      if(!hasData)setLoading(false);
+    }
   };
 
   const refreshQuotes=async()=>{
     setRefreshing(true);
     try{
-      const r=await fetch(`${API}?action=refreshQuotes`,{cache:'no-store'});
+      const r=await fetch(`${API}?action=refreshQuotes`);
       const next=await r.json();
-      if(!r.ok||next.success===false||next.ok===false)throw new Error(next.error||'Could not refresh prices.');
-      setData(d=>({...d,quotes:next.quotes||d.quotes,market:next.market||d.market,holdings:next.holdings||d.holdings,totals:next.totals||d.totals,importedHoldings:next.importedHoldings||d.importedHoldings}));
-    }catch(e){setError(e.message||'Could not refresh prices.')}
-    finally{setRefreshing(false)}
+      if(!r.ok||next.success===false||next.ok===false)throw new Error(r.status===404?'Ledgerly Apps Script deployment was not found. Deploy the current Code.gs as a web app and update client/.env with its /exec URL.':next.error||'Could not refresh prices.');
+      setData(d=>({...d,
+        quotes:next.quotes||d.quotes,
+        market:next.market||d.market,
+        holdings:next.holdings||d.holdings,
+        totals:next.totals||d.totals,
+        importedHoldings:next.importedHoldings||d.importedHoldings,
+        lastQuoteRefresh:Date.now()
+      }));
+    }catch(e){
+      setError(e.message||'Could not refresh prices.');
+    }finally{
+      setRefreshing(false);
+    }
   };
 
+  useEffect(()=>{load()},[period]);
   useEffect(()=>{
-    const cached=cachedPortfolio(period);
-    if(cached)setData(cached);
-    load({silent:!!cached});
-  },[period]);
-  useEffect(()=>{const timer=setInterval(()=>{if(!document.hidden&&!refreshing)refreshQuotes()},60000);return()=>clearInterval(timer)},[refreshing]);
-
+    const timer=setInterval(()=>{
+      if(!document.hidden)refreshQuotes();
+    },60000);
+    return()=>clearInterval(timer);
+  },[]);
   const holdings=data.holdings||[];
   const totals=data.totals||{invested:0,value:0,pnl:0,returnPct:0,realized:0,todayPnl:0};
   const finance={...safeFinance(data.finance),bankAccounts:safeArray(data.finance?.bankAccounts??data.bankAccounts),bankTotal:data.finance?.bankTotal??data.bankTotal};
@@ -219,7 +262,7 @@ function App(){
   return <div className="app">
     <aside className={`sidebar ${mobileOpen?'open':''}`}>
       <div className="brand"><div className="brandmark">L</div><div><b>Ledgerly</b><span>Wealth dashboard</span></div></div>
-      {nav.map(([id,label,Icon])=><button key={id} className={`nav ${tab===id?'active':''}`} onClick={()=>{setTab(id);setMobileOpen(false)}}><Icon size={19}/>{label}</button>)}
+      {nav.map(([id,label,Icon])=><button key={id} className={`nav ${tab===id?'active':''}`} onClick={()=>{sessionStorage.setItem('ledgerly.activeTab',id);setTab(id);setMobileOpen(false)}}><Icon size={19}/>{label}</button>)}
       <div className="side-bottom"><div className="secure"><CircleDollarSign size={18}/><div><b>Private by design</b><span>Ledgerly + Finance Assistant</span></div></div></div>
     </aside>
     {mobileOpen&&<div className="scrim" onClick={()=>setMobileOpen(false)}/>}
@@ -384,7 +427,12 @@ function FinanceActivityPage({transactions,period}){
   const [type,setType]=useState('all');
   const [account,setAccount]=useState('all');
   const accounts=[...new Set(transactions.map(t=>String(t.account||'').trim()).filter(Boolean))].sort();
-  const filtered=transactions.filter(t=>{
+  const filtered=transactions.slice().sort((a,b)=>{
+    const first=Date.parse(String(a.date||''));
+    const second=Date.parse(String(b.date||''));
+    if(Number.isNaN(first)||Number.isNaN(second))return String(b.date||'').localeCompare(String(a.date||''));
+    return second-first;
+  }).filter(t=>{
     const text=`${t.merchant||''} ${t.category||''} ${t.subcategory||''} ${t.account||''} ${t.paymentMode||t.payment_mode||''} ${t.remarks||t.note||''}`.toLowerCase();
     const typ=String(t.type||t.transactionType||'').toLowerCase();
     return text.includes(q.toLowerCase()) &&
@@ -410,7 +458,7 @@ function FinanceActivityPage({transactions,period}){
 }
 
 function AnalyticsPage({holdings,totals,finance,snapshots}){
-  const monthly=safeArray(finance.monthly||finance.cashFlow); const monthlyTrend=safeArray(finance.monthlyTrend||monthly);
+  const monthly=normalizeMonthlyRows(finance); const monthlyTrend=monthly;
   const categories=safeArray(finance.categorySpending||finance.categories);
   const payments=safeArray(finance.paymentModeSpending);
   const merchants=safeArray(finance.merchantSpending);
@@ -471,18 +519,84 @@ function HoldingEditModal({holding,onClose,onSaved}){
   const original=holding.importedStock||holding.mutualFund||{};
   const [form,setForm]=useState({...original});const [saving,setSaving]=useState(false);
   const update=(key,value)=>setForm(current=>({...current,[key]:value}));
-  const submit=async event=>{event.preventDefault();setSaving(true);try{const response=await fetch(API,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({action:'updateHolding',kind:source,...form})});const result=await response.json();if(!response.ok||result.success===false||result.ok===false)throw new Error(result.error||'Could not update holding');onSaved()}catch(error){alert(error.message||'Could not update holding')}finally{setSaving(false)}};
+  const submit=async event=>{event.preventDefault();setSaving(true);try{const response=await fetch(API,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({action:'updateHolding',kind:source,...form})});const result=await response.json();if(!response.ok||result.success===false||result.ok===false)throw new Error(result.error||result.message||'Could not update holding');onSaved()}catch(error){alert(error.message||'Could not update holding')}finally{setSaving(false)}};
   return <div className="modal-backdrop"><div className="modal"><div className="modal-head"><div><span className="eyebrow">MANUAL ADJUSTMENT</span><h2>Edit holding</h2></div><button className="icon-btn" onClick={onClose}><X/></button></div><form onSubmit={submit}>{source==='stocks'?<div className="form-grid"><label>Stock name<input required value={form.symbol||''} onChange={e=>update('symbol',e.target.value.toUpperCase())}/></label><label>ISIN<input value={form.isin||''} onChange={e=>update('isin',e.target.value)}/></label><label>Quantity<input required type="number" step="any" min="0" value={form.qty??0} onChange={e=>update('qty',e.target.value)}/></label><label>Average buy price<input type="number" step="any" min="0" value={form.avg??0} onChange={e=>update('avg',e.target.value)}/></label><label>Buy value<input required type="number" step="any" min="0" value={form.invested??0} onChange={e=>update('invested',e.target.value)}/></label><label>Closing price<input required type="number" step="any" min="0" value={form.ltp??0} onChange={e=>update('ltp',e.target.value)}/></label><label>Closing value<input required type="number" step="any" min="0" value={form.value??0} onChange={e=>update('value',e.target.value)}/></label></div>:<div className="form-grid"><label>Scheme name<input required value={form.schemeName||''} onChange={e=>update('schemeName',e.target.value)}/></label><label>Folio no.<input value={form.folioNo||''} onChange={e=>update('folioNo',e.target.value)}/></label><label>Units<input required type="number" step="any" min="0" value={form.units??0} onChange={e=>update('units',e.target.value)}/></label><label>Invested value<input required type="number" step="any" min="0" value={form.invested??0} onChange={e=>update('invested',e.target.value)}/></label><label>Current value<input required type="number" step="any" min="0" value={form.value??0} onChange={e=>update('value',e.target.value)}/></label><label>XIRR<input type="number" step="any" value={form.xirr??0} onChange={e=>update('xirr',e.target.value)}/></label></div>}<div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Cancel</button><button className="primary" disabled={saving}>{saving?'Saving...':'Save changes'}</button></div></form></div></div>
 }
 
 function BankAccountEditModal({account,onClose,onSaved}){
-  const [form,setForm]=useState({name:accountName(account)==='Unnamed account'?'':accountName(account),type:account.type||'Bank account',balance:account.balance??0});
+  const [form,setForm]=useState({
+    account:accountName(account),
+    name:accountName(account),
+    type:account.type||'Bank Account',
+    currentBalance:account.balance??0,
+    openingBalance:account.openingBalance??0,
+    openingDate:account.openingDate||'',
+    manualAdjustment:account.manualAdjustment??0,
+    active:account.active!==false,
+    notes:account.notes||''
+  });
   const [saving,setSaving]=useState(false);
-  const update=(key,value)=>setForm(current=>({...current,[key]:value}));
-  const submit=async event=>{event.preventDefault();setSaving(true);try{const response=await fetch(API,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({action:'updateBankAccount',account:accountName(account),...form})});const result=await response.json();if(!response.ok||result.success===false||result.ok===false)throw new Error(result.error||'Could not update bank account');onSaved()}catch(error){alert(error.message||'Could not update bank account')}finally{setSaving(false)}};
-  return <div className="modal-backdrop"><div className="modal"><div className="modal-head"><div><span className="eyebrow">ACCOUNT DETAILS</span><h2>Edit bank account</h2></div><button className="icon-btn" onClick={onClose} aria-label="Close"><X/></button></div><form onSubmit={submit}><div className="form-grid"><label>Account name<input required value={form.name} onChange={event=>update('name',event.target.value)}/></label><label>Account type<input value={form.type} onChange={event=>update('type',event.target.value)}/></label><label>Balance<input required type="number" step="any" value={form.balance} onChange={event=>update('balance',event.target.value)}/></label></div><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Cancel</button><button className="primary" disabled={saving}>{saving?'Saving...':'Save changes'}</button></div></form></div></div>
+  const update=(key,value)=>setForm(f=>({...f,[key]:value}));
+  const submit=async e=>{
+    e.preventDefault();
+    if(!String(form.name||'').trim())return alert('Account name is required.');
+    setSaving(true);
+    try{
+      const r=await fetch(API,{
+        method:'POST',
+        headers:{'Content-Type':'text/plain;charset=utf-8'},
+        body:JSON.stringify({
+          action:'updateBankAccount',
+          account:accountName(account),
+          name:String(form.name).trim(),
+          type:String(form.type||'Bank Account').trim(),
+          currentBalance:Number(form.currentBalance||0),
+          openingBalance:Number(form.openingBalance||0),
+          openingDate:String(form.openingDate||''),
+          manualAdjustment:Number(form.manualAdjustment||0),
+          active:!!form.active,
+          notes:String(form.notes||'')
+        })
+      });
+      const next=await r.json();
+      if(!r.ok||next.success===false||next.ok===false)
+        throw new Error(next.error||next.message||'Could not update bank account.');
+      onSaved();
+    }catch(err){
+      alert(err.message||'Could not update bank account.');
+    }finally{
+      setSaving(false);
+    }
+  };
+  return <div className="modal-backdrop">
+    <div className="modal">
+      <div className="modal-head">
+        <div><span className="eyebrow">ACCOUNT DETAILS</span><h2>Edit bank account</h2></div>
+        <button className="icon-btn" onClick={onClose} aria-label="Close"><X/></button>
+      </div>
+      <form onSubmit={submit}>
+        <div className="form-grid">
+          <label>Account name<input required value={form.name} onChange={e=>update('name',e.target.value)}/></label>
+          <label>Account type<input value={form.type} onChange={e=>update('type',e.target.value)}/></label>
+          <label>Current balance<input required type="number" step="any" value={form.currentBalance} onChange={e=>update('currentBalance',e.target.value)}/></label>
+          <label>Opening balance<input required type="number" step="any" value={form.openingBalance} onChange={e=>update('openingBalance',e.target.value)}/></label>
+          <label>Opening date<input type="date" value={form.openingDate} onChange={e=>update('openingDate',e.target.value)}/></label>
+          <label>Manual adjustment (calculated)<input type="number" step="any" value={form.manualAdjustment} readOnly/></label>
+          <label className="checkbox-label"><span>Active account</span><input type="checkbox" checked={form.active} onChange={e=>update('active',e.target.checked)}/></label>
+          <label>Notes<input value={form.notes} onChange={e=>update('notes',e.target.value)}/></label>
+        </div>
+        <div className="feed-note">
+          <Wifi size={15}/>
+          <span>Changing <b>Current balance</b> adjusts the Finance Assistant manual adjustment so existing transactions are preserved. Renaming the account also updates existing Finance Assistant transaction account references.</span>
+        </div>
+        <div className="modal-actions">
+          <button type="button" className="secondary" onClick={onClose}>Cancel</button>
+          <button className="primary" disabled={saving}>{saving?'Saving...':'Save changes'}</button>
+        </div>
+      </form>
+    </div>
+  </div>
 }
-
 function TransactionModal({finance,onClose,onSaved}){
   const accounts=safeArray(finance.bankAccounts);
   const [form,setForm]=useState({type:'BUY',assetType:'STOCK',symbol:'',date:new Date().toISOString().slice(0,10),quantity:'',price:'',charges:'',note:'',fundingAccount:''});
@@ -490,7 +604,7 @@ function TransactionModal({finance,onClose,onSaved}){
   const update=(k,v)=>setForm(f=>({...f,[k]:v}));
   const submit=async e=>{e.preventDefault();if(!form.fundingAccount)return alert('Select the bank account used for this investment.');setSaving(true);try{const r=await fetch(API,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({action:'transaction',...form})});const next=await r.json();if(!r.ok||next.success===false||next.ok===false)throw new Error(next.error||'Could not save transaction');onSaved()}catch(err){alert(err.message||'Could not save transaction')}finally{setSaving(false)}};
   const total=Number(form.quantity||0)*Number(form.price||0)+Number(form.charges||0);
-  return <div className="modal-backdrop"><div className="modal"><div className="modal-head"><div><span className="eyebrow">INVESTMENT CASH FLOW</span><h2>Add investment transaction</h2></div><button className="icon-btn" onClick={onClose}><X/></button></div><form onSubmit={submit}><div className="seg"><button type="button" className={form.type==='BUY'?'on':''} onClick={()=>update('type','BUY')}>Buy</button><button type="button" className={form.type==='SELL'?'on':''} onClick={()=>update('type','SELL')}>Sell</button></div><div className="form-grid"><label>Asset type<select value={form.assetType} onChange={e=>update('assetType',e.target.value)}><option value="STOCK">Stock</option><option value="MF">Mutual fund</option></select></label><label>Symbol / scheme<input required placeholder="e.g. RELIANCE" value={form.symbol} onChange={e=>update('symbol',e.target.value.toUpperCase())}/></label><label>Date<input required type="date" value={form.date} onChange={e=>update('date',e.target.value)}/></label><label>Quantity<input required min="0.000001" step="any" type="number" value={form.quantity} onChange={e=>update('quantity',e.target.value)}/></label><label>Traded price / NAV<input required min="0" step="any" type="number" value={form.price} onChange={e=>update('price',e.target.value)}/></label><label>Brokerage + charges<input min="0" step="any" type="number" value={form.charges} onChange={e=>update('charges',e.target.value)}/></label><label>Pay from / receive into<select required value={form.fundingAccount} onChange={e=>update('fundingAccount',e.target.value)}><option value="">Select account</option>{accounts.map(a=><option key={a.name} value={a.name}>{a.name}</option>)}</select></label><label>Note<input placeholder="Optional" value={form.note} onChange={e=>update('note',e.target.value)}/></label></div><div className="cash-impact"><span>{form.type==='BUY'?'Cash outflow':'Cash inflow'}</span><b>{money(total)}</b><small>{form.fundingAccount?'Finance Assistant will receive the cash-flow entry for this account.':'Select an account to link cash flow.'}</small></div><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Cancel</button><button className="primary" disabled={saving}>{saving?'Saving…':'Save transaction'}</button></div></form></div></div>
+  return <div className="modal-backdrop"><div className="modal"><div className="modal-head"><div><span className="eyebrow">INVESTMENT CASH FLOW</span><h2>Add investment transaction</h2></div><button className="icon-btn" onClick={onClose}><X/></button></div><form onSubmit={submit}><div className="seg"><button type="button" className={form.type==='BUY'?'on':''} onClick={()=>update('type','BUY')}>Buy</button><button type="button" className={form.type==='SELL'?'on':''} onClick={()=>update('type','SELL')}>Sell</button></div><div className="form-grid"><label>Asset type<select value={form.assetType} onChange={e=>update('assetType',e.target.value)}><option value="STOCK">Stock</option><option value="MF">Mutual fund</option></select></label><label>Symbol / scheme<input required placeholder="e.g. RELIANCE" value={form.symbol} onChange={e=>update('symbol',e.target.value.toUpperCase())}/></label><label>Date<input required type="date" value={form.date} onChange={e=>update('date',e.target.value)}/></label><label>Quantity<input required min="0.000001" step="any" type="number" value={form.quantity} onChange={e=>update('quantity',e.target.value)}/></label><label>Traded price / NAV<input required min="0" step="any" type="number" value={form.price} onChange={e=>update('price',e.target.value)}/></label><label>Brokerage + charges<input min="0" step="any" type="number" value={form.charges} onChange={e=>update('charges',e.target.value)}/></label><label>Pay from / receive into<select required value={form.fundingAccount} onChange={e=>update('fundingAccount',e.target.value)}><option value="">Select account</option>{accounts.map(a=><option key={accountName(a)} value={accountName(a)}>{accountName(a)}</option>)}</select></label><label>Note<input placeholder="Optional" value={form.note} onChange={e=>update('note',e.target.value)}/></label></div><div className="cash-impact"><span>{form.type==='BUY'?'Cash outflow':'Cash inflow'}</span><b>{money(total)}</b><small>{form.fundingAccount?'Finance Assistant will receive the cash-flow entry for this account.':'Select an account to link cash flow.'}</small></div><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Cancel</button><button className="primary" disabled={saving}>{saving?'Saving…':'Save transaction'}</button></div></form></div></div>
 }
 
 function Empty({icon,title,text}){return <div className="empty">{icon&&<div className="empty-icon">{icon}</div>}<h3>{title}</h3><p>{text}</p></div>}
