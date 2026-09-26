@@ -82,6 +82,11 @@ The Apps Script web app supports:
 - `POST {"action":"quote", "symbol":"RELIANCE", "price":1500}`
 - `POST {"action":"snapshot"}`
 - `POST {"action":"importMutualFunds","rows":[...]}`
+- `POST {"action":"updateBankAccount","accountId":"...","name":"...","type":"...","balance":0}`
+
+### Bank accounts
+
+Bank accounts remain owned by Finance Assistant. Ledgerly reads them from `ledgerlyDashboardData`; the Accounts page sends edits through Ledgerly to Finance Assistant using `ledgerlyUpdateBankAccount`, then reloads the portfolio so the new name is reflected everywhere.
 
 ### Import mutual funds
 
