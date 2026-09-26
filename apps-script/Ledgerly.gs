@@ -8,8 +8,15 @@
 
 const LEDGERLY_CONFIG = {
   spreadsheetId: "1nw8QpT85epAlmAmtNf3yLZ8JrM5uOb3LqHSTgukcf2Q",
-  financeApiUrlProperty: "https://script.google.com/macros/s/AKfycbxJsI03Hmr2FjzLxdIWOmLoMycSeb1rA3ounMdG6h-c0rpjXpmRwqueO8IUVttfVVVC/exec",
-  financeSecretProperty: "1nw8QpT85epAlmAmtNf3yLZ8JrM5uOb3LqHSTgukcf2Q"
+  financeApiUrlProperty: "FINANCE_ASSISTANT_API_URL",
+  financeSecretProperty: "FINANCE_ASSISTANT_API_SECRET"
+};
+
+const LEDGERLY_PERF = {
+  portfolioCacheSeconds: 15, dataCacheSeconds: 300, quoteCacheSeconds: 30,
+  txKey: "ledgerly_tx_v1", quotesKey: "ledgerly_quotes_v1",
+  snapshotsKey: "ledgerly_snapshots_v1", mfKey: "ledgerly_mf_v1", stocksKey: "ledgerly_stocks_v1",
+  refreshKey: "LEDGERLY_LAST_QUOTE_REFRESH"
 };
 
 const SHEETS = {
@@ -43,7 +50,19 @@ function setupLedgerlySheet() {
   ]);
   seed2026Holidays_();
   rebuildLots_();
+  installLedgerlyMaintenanceTrigger_();
   return {success:true, message:'Isolated Ledgerly sheets are ready.'};
+}
+
+function installLedgerlyMaintenanceTrigger_(){
+  ScriptApp.getProjectTriggers().forEach(t=>{
+    if(t.getHandlerFunction()==='ledgerlyMaintenance_') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('ledgerlyMaintenance_').timeBased().everyMinutes(5).create();
+}
+
+function ledgerlyMaintenance_(){
+  try{rebuildLots_();}catch(err){console.error(err);}
 }
 
 function setFinanceAssistantConnection(apiUrl, secret) {
@@ -101,7 +120,7 @@ function handle_(e, method) {
     if (action === 'portfolio') result = getPortfolio_(body.period || params.period || 'this-month');
     else if (action === 'transactions') result = {success:true,transactions: readTransactions_()};
     else if (action === 'quotes') result = {success:true,quotes: readQuotes_()};
-    else if (action === 'lots') result = {success:true,lots: readLots_()};
+    else if (action === 'lots') result = {success:true,lots: calculateAllLots_().map(l=>({lotId:l.lotId,transactionId:l.transactionId,symbol:l.symbol,assetType:l.assetType,buyDate:l.buyDate,originalQty:l.originalQty,remainingQty:l.remainingQty,buyPrice:l.buyPrice,cost:l.originalQty*l.buyPrice,status:l.remainingQty>0?'OPEN':'CLOSED'}))};
     else if (action === 'marketStatus') result = getMarketStatus_();
     else if (action === 'refreshQuotes') result = refreshLiveQuotes_();
     else if (action === 'transaction') result = addTransaction_(body);
@@ -121,48 +140,25 @@ function handle_(e, method) {
   }
 }
 
-function updateBankAccount_(input) {
-  const oldName = String(input.account || input.accountName || '').trim();
-  const newName = String(input.name || '').trim();
-  const result = callFinanceAssistant_({
-    action: 'ledgerlyUpdateBankAccount',
-    account: oldName,
-    name: newName,
-    type: String(input.type || 'Bank Account').trim(),
-    currentBalance: Number(input.currentBalance || 0),
-    openingBalance: Number(input.openingBalance || 0),
-    openingDate: String(input.openingDate || '').trim(),
-    manualAdjustment: Number(input.manualAdjustment || 0),
-    active: input.active !== false,
-    notes: String(input.notes || '')
-  });
-
-  if (oldName && newName && oldName.toLowerCase() !== newName.toLowerCase()) {
-    const sh = getLedgerlySpreadsheet_().getSheetByName(SHEETS.transactions);
-    if (sh && sh.getLastRow() >= 2) {
-      const lastCol = sh.getLastColumn();
-      const headers = sh.getRange(1,1,1,lastCol).getValues()[0].map(v=>String(v).trim());
-      const fundingCol = headers.indexOf('Funding Account');
-      if (fundingCol >= 0) {
-        const vals = sh.getRange(2,1,sh.getLastRow()-1,lastCol).getValues();
-        let changed = false;
-        vals.forEach(row=>{
-          if (String(row[fundingCol]||'').trim().toLowerCase() === oldName.toLowerCase()) {
-            row[fundingCol] = newName;
-            changed = true;
-          }
-        });
-        if (changed) sh.getRange(2,1,vals.length,lastCol).setValues(vals);
-      }
-    }
-  }
-
-  return {success:true,account:result.account||null,bankTotal:Number(result.bankTotal||0)};
-}
-
 function connectionTest_() {
   const d = callFinanceAssistant_({action:'ledgerlyDashboardData', period:'this-month'});
   return {success:true,financeAssistant:true,bankAccounts:d.bankAccounts||[],expenseSummary:d.expenseSummary||{}};
+}
+
+function updateBankAccount_(input) {
+  const accountId = String(input.accountId || input.id || '').trim();
+  const name = String(input.name || input.accountName || '').trim();
+  if (!accountId || !name) throw new Error('Bank account ID and name are required.');
+  const result = callFinanceAssistant_({
+    action:'ledgerlyUpdateBankAccount',
+    accountId,
+    id:accountId,
+    name,
+    accountName:name,
+    type:String(input.type || 'Bank account').trim(),
+    balance:Number(input.balance || 0)
+  });
+  return {success:true,account:result.account||result.bankAccount||null};
 }
 
 function testLedgerlyFinanceConnection() {
@@ -178,8 +174,16 @@ function json_(obj, callback) {
 
 function getLedgerlySpreadsheet_() { return SpreadsheetApp.openById(LEDGERLY_CONFIG.spreadsheetId); }
 
+function cacheGetJson_(key){try{const raw=CacheService.getScriptCache().get(key);return raw?JSON.parse(raw):null;}catch(_){return null;}}
+function cachePutJson_(key,value,ttl){try{const raw=JSON.stringify(value);if(raw.length<95000)CacheService.getScriptCache().put(key,raw,ttl);}catch(_){}}
+function cacheRemove_(key){try{CacheService.getScriptCache().remove(key);}catch(_) {}}
+function invalidateLedgerlyCaches_(){[LEDGERLY_PERF.txKey,LEDGERLY_PERF.quotesKey,LEDGERLY_PERF.snapshotsKey,LEDGERLY_PERF.mfKey,LEDGERLY_PERF.stocksKey,'ledgerly_portfolio_this-month','ledgerly_portfolio_last-month','ledgerly_portfolio_last-3-months','ledgerly_portfolio_last-6-months','ledgerly_portfolio_this-year','ledgerly_portfolio_all','ledgerly_portfolio_all-time'].forEach(cacheRemove_);}
+
 function getPortfolio_(period) {
   period = String(period || "this-month");
+  const cacheKey='ledgerly_portfolio_'+period;
+  const cached=cacheGetJson_(cacheKey);
+  if(cached)return cached;
 
   const transactions = readTransactions_();
   const quotes = readQuotes_();
@@ -250,7 +254,7 @@ function getPortfolio_(period) {
   const other = value - stocks - mfs;
   const liabilities = 0;
 
-  return {
+  const result = {
     success: true,
 
     // Investment data
@@ -296,54 +300,26 @@ function getPortfolio_(period) {
 
     market: getMarketStatus_()
   };
+  cachePutJson_(cacheKey,result,LEDGERLY_PERF.portfolioCacheSeconds);
+  return result;
 }
 
 function addTransaction_(input) {
   const lock=LockService.getScriptLock(); lock.waitLock(20000);
   try {
-    const type=String(input.type || input.transactionType || '').toUpperCase();
-    const symbol=String(input.symbol || '').trim().toUpperCase();
-    const date=String(input.date || '').trim();
-    const assetType=String(input.assetType || 'STOCK').toUpperCase();
-    const qty=Number(input.quantity), price=Number(input.price), charges=Number(input.charges || 0);
-    const funding=String(input.fundingAccount || input.account || '').trim();
-    const note=String(input.note || input.notes || '');
-    if(!['BUY','SELL'].includes(type)) throw new Error('Transaction type must be BUY or SELL.');
-    if(!symbol || !date || !(qty>0) || !(price>0) || !(charges>=0)) throw new Error('Check symbol, date, quantity, price and charges.');
-    if(type==='SELL'){
-      const available=calculate_(readTransactions_(),readQuotes_()).lots.filter(l=>l.symbol===symbol&&l.remainingQty>0).reduce((s,l)=>s+l.remainingQty,0);
-      if(qty>available+1e-9) throw new Error('Cannot sell more than the available quantity for '+symbol+'.');
-    }
-
-    const amount = type==='BUY' ? qty*price+charges : qty*price-charges;
-    if (!(amount > 0)) throw new Error('Sale proceeds after charges must be positive.');
-
-    // Cash-flow is created in Finance Assistant first. If Ledgerly fails afterwards,
-    // the finance transaction is rolled back using its immutable ID.
-    const finance = callFinanceAssistant_({
-      action:'ledgerlyCashFlow',
-      financeType:type==='BUY' ? 'Investment' : 'Income',
-      amount,
-      account:funding,
-      date,
-      symbol,
-      assetType,
-      remarks:'Ledgerly '+(type==='BUY'?'investment purchase':'investment sale proceeds')
-    });
-    const financeId=String(finance.financeTransactionId || '');
-    if(!financeId) throw new Error('Finance Assistant did not return a transaction ID.');
-
+    const type=String(input.type || input.transactionType || '').toUpperCase(), symbol=String(input.symbol || '').trim().toUpperCase(), date=String(input.date || '').trim(), assetType=String(input.assetType || 'STOCK').toUpperCase();
+    const qty=Number(input.quantity), price=Number(input.price), charges=Number(input.charges || 0), funding=String(input.fundingAccount || input.account || '').trim(), note=String(input.note || input.notes || '');
+    if(!['BUY','SELL'].includes(type))throw new Error('Transaction type must be BUY or SELL.');
+    if(!symbol||!date||!(qty>0)||!(price>0)||!(charges>=0))throw new Error('Check symbol, date, quantity, price and charges.');
+    if(type==='SELL'){const available=calculate_(readTransactions_(),readQuotes_()).lots.filter(l=>l.symbol===symbol&&l.remainingQty>0).reduce((s,l)=>s+l.remainingQty,0);if(qty>available+1e-9)throw new Error('Cannot sell more than the available quantity for '+symbol+'.');}
+    const amount=type==='BUY'?qty*price+charges:qty*price-charges;if(!(amount>0))throw new Error('Sale proceeds after charges must be positive.');
+    const finance=callFinanceAssistant_({action:'ledgerlyCashFlow',financeType:type==='BUY'?'Investment':'Income',amount,account:funding,date,symbol,assetType,remarks:'Ledgerly '+(type==='BUY'?'investment purchase':'investment sale proceeds')});
+    const financeId=String(finance.financeTransactionId||'');if(!financeId)throw new Error('Finance Assistant did not return a transaction ID.');
     const id='TXN-'+Utilities.getUuid().slice(0,8).toUpperCase();
-    try {
-      getLedgerlySpreadsheet_().getSheetByName(SHEETS.transactions).appendRow([id,date,symbol,assetType,type,qty,price,charges,funding,note,new Date(),financeId]);
-      rebuildLots_();
-    } catch (err) {
-      try { callFinanceAssistant_({action:'ledgerlyDeleteFinanceTransaction',financeTransactionId:financeId}); } catch (_) {}
-      throw err;
-    }
-
-    return {success:true,id,transaction:readTransactions_().find(t=>t.id===id),portfolio:getPortfolio_()};
-  } finally { lock.releaseLock(); }
+    try{getLedgerlySpreadsheet_().getSheetByName(SHEETS.transactions).appendRow([id,date,symbol,assetType,type,qty,price,charges,funding,note,new Date(),financeId]);invalidateLedgerlyCaches_();}
+    catch(err){try{callFinanceAssistant_({action:'ledgerlyDeleteFinanceTransaction',financeTransactionId:financeId});}catch(_){}throw err;}
+    return {success:true,id,transaction:{id,date,symbol,assetType,type,quantity:qty,price,charges,fundingAccount:funding,note,createdAt:Date.now(),financeTransactionId:financeId}};
+  } finally {lock.releaseLock();}
 }
 
 function deleteTransaction_(id) {
@@ -354,23 +330,13 @@ function deleteTransaction_(id) {
     const financeId=String(values[r][11]||'');
     sh.deleteRow(r+1);
     if(financeId) callFinanceAssistant_({action:'ledgerlyDeleteFinanceTransaction',financeTransactionId:financeId});
-    rebuildLots_();
+    invalidateLedgerlyCaches_();
     return {success:true};
   }
   throw new Error('Transaction not found.');
 }
 
-function readTransactions_(){
-  const sh=getLedgerlySpreadsheet_().getSheetByName(SHEETS.transactions);
-  if(!sh||sh.getLastRow()<2)return [];
-  const rows=sh.getDataRange().getValues(), headers=rows[0].map(v=>String(v).trim()), idx={}; headers.forEach((h,i)=>idx[h]=i);
-  return rows.slice(1).filter(r=>r[idx.ID]).map(r=>({
-    id:String(r[idx.ID]),date:formatDate_(r[idx.Date]),symbol:String(r[idx.Symbol]).toUpperCase(),assetType:String(r[idx['Asset Type']]||'STOCK').toUpperCase(),
-    type:String(r[idx['Transaction Type']]).toUpperCase(),quantity:Number(r[idx.Quantity]),price:Number(r[idx.Price]),charges:Number(r[idx.Charges]||0),
-    fundingAccount:String(r[idx['Funding Account']]||''),note:String(r[idx.Notes]||''),createdAt:new Date(r[idx['Created At']]||r[idx.Date]).getTime(),financeTransactionId:String(r[idx['Finance Transaction ID']]||''),
-    total:Number(r[idx.Quantity])*Number(r[idx.Price])+(String(r[idx['Transaction Type']]).toUpperCase()==='SELL'?-Number(r[idx.Charges]||0):Number(r[idx.Charges]||0))
-  })).sort((a,b)=>b.date.localeCompare(a.date)||b.createdAt-a.createdAt);
-}
+function readTransactions_(){const cached=cacheGetJson_(LEDGERLY_PERF.txKey);if(cached)return cached;const sh=getLedgerlySpreadsheet_().getSheetByName(SHEETS.transactions);if(!sh||sh.getLastRow()<2)return [];const rows=sh.getDataRange().getValues(),headers=rows[0].map(v=>String(v).trim()),idx={};headers.forEach((h,i)=>idx[h]=i);const out=rows.slice(1).filter(r=>r[idx.ID]).map(r=>({id:String(r[idx.ID]),date:formatDate_(r[idx.Date]),symbol:String(r[idx.Symbol]).toUpperCase(),assetType:String(r[idx['Asset Type']]||'STOCK').toUpperCase(),type:String(r[idx['Transaction Type']]).toUpperCase(),quantity:Number(r[idx.Quantity]),price:Number(r[idx.Price]),charges:Number(r[idx.Charges]||0),fundingAccount:String(r[idx['Funding Account']]||''),note:String(r[idx.Notes]||''),createdAt:new Date(r[idx['Created At']]||r[idx.Date]).getTime(),financeTransactionId:String(r[idx['Finance Transaction ID']]||''),total:Number(r[idx.Quantity])*Number(r[idx.Price])+(String(r[idx['Transaction Type']]).toUpperCase()==='SELL'?-Number(r[idx.Charges]||0):Number(r[idx.Charges]||0))})).sort((a,b)=>b.date.localeCompare(a.date)||b.createdAt-a.createdAt);cachePutJson_(LEDGERLY_PERF.txKey,out,LEDGERLY_PERF.dataCacheSeconds);return out;}
 
 function calculate_(transactions, quotes) {
   const lots = [], realized = {value:0};
@@ -429,25 +395,72 @@ function calculateAllLots_(){
   return lots;
 }
 
-function readQuotes_(){
-  const sh=getLedgerlySpreadsheet_().getSheetByName(SHEETS.quotes),out={}; if(!sh||sh.getLastRow()<2)return out;
-  sh.getRange(2,1,sh.getLastRow()-1,4).getValues().filter(r=>r[0]).forEach(r=>out[String(r[0]).toUpperCase()]={price:Number(r[1]),previousClose:Number(r[2]||0),updatedAt:formatDateTime_(r[3])}); return out;
+function readQuotes_(){const cached=cacheGetJson_(LEDGERLY_PERF.quotesKey);if(cached)return cached;const sh=getLedgerlySpreadsheet_().getSheetByName(SHEETS.quotes),out={};if(!sh||sh.getLastRow()<2)return out;sh.getRange(2,1,sh.getLastRow()-1,4).getValues().filter(r=>r[0]).forEach(r=>out[String(r[0]).toUpperCase()]={price:Number(r[1]),previousClose:Number(r[2]||0),updatedAt:formatDateTime_(r[3])});cachePutJson_(LEDGERLY_PERF.quotesKey,out,LEDGERLY_PERF.dataCacheSeconds);return out;}
+function readMutualFunds_(){
+  const cached=cacheGetJson_(LEDGERLY_PERF.mfKey);
+  if(cached)return cached;
+  const sh=getLedgerlySpreadsheet_().getSheetByName(SHEETS.mutualFunds);
+  if(!sh||sh.getLastRow()<2)return [];
+  const out=sh.getRange(2,1,sh.getLastRow()-1,MUTUAL_FUND_HEADERS.length).getValues()
+    .filter(r=>r[0])
+    .map(r=>({
+      schemeName:String(r[0]||''),
+      amc:String(r[1]||''),
+      category:String(r[2]||''),
+      subCategory:String(r[3]||''),
+      folioNo:String(r[4]||''),
+      source:String(r[5]||''),
+      units:Number(r[6])||0,
+      invested:Number(r[7])||0,
+      value:Number(r[8])||0,
+      returns:Number(r[9])||0,
+      xirr:Number(r[10])||0
+    }));
+  cachePutJson_(LEDGERLY_PERF.mfKey,out,LEDGERLY_PERF.dataCacheSeconds);
+  return out;
 }
-function readSnapshots_(){const sh=getLedgerlySpreadsheet_().getSheetByName(SHEETS.snapshots);if(!sh||sh.getLastRow()<2)return [];return sh.getRange(2,1,sh.getLastRow()-1,4).getValues().filter(r=>r[0]).map(r=>({date:formatDate_(r[0]),value:Number(r[1]),invested:Number(r[2]),pnl:Number(r[3])}));}
-function readLots_(){const sh=getLedgerlySpreadsheet_().getSheetByName(SHEETS.lots);if(!sh||sh.getLastRow()<2)return [];return sh.getRange(2,1,sh.getLastRow()-1,10).getValues().filter(r=>r[0]).map(r=>({lotId:String(r[0]),transactionId:String(r[1]),symbol:String(r[2]),assetType:String(r[3]||'STOCK'),buyDate:formatDate_(r[4]),originalQty:Number(r[5]),remainingQty:Number(r[6]),buyPrice:Number(r[7]),cost:Number(r[8]),status:String(r[9])}));}
-function readMutualFunds_(){const sh=getLedgerlySpreadsheet_().getSheetByName(SHEETS.mutualFunds);if(!sh||sh.getLastRow()<2)return [];return sh.getRange(2,1,sh.getLastRow()-1,MUTUAL_FUND_HEADERS.length).getValues().filter(r=>r[0]).map(r=>({schemeName:String(r[0]),amc:String(r[1]||''),category:String(r[2]||''),subCategory:String(r[3]||''),folioNo:String(r[4]||''),source:String(r[5]||''),units:Number(r[6])||0,invested:Number(r[7])||0,value:Number(r[8])||0,returns:Number(r[9])||0,xirr:Number(r[10])||0}));}
-function readImportedStocks_(){const sh=getLedgerlySpreadsheet_().getSheetByName(SHEETS.stocks);if(!sh||sh.getLastRow()<2)return [];return sh.getRange(2,1,sh.getLastRow()-1,STOCK_HEADERS.length).getValues().filter(r=>r[0]).map(r=>({symbol:String(r[0]),isin:String(r[1]||''),qty:Number(r[2])||0,avg:Number(r[3])||0,invested:Number(r[4])||0,ltp:Number(r[5])||0,value:Number(r[6])||0,pnl:Number(r[7])||0}));}
-function mutualFundHolding_(fund){const symbol=fund.schemeName||fund.folioNo||'Mutual fund';const qty=fund.units;const avg=qty?fund.invested/qty:0;const ltp=qty?fund.value/qty:0;const pnl=fund.value-fund.invested;return {symbol,displayName:fund.schemeName,qty,invested:fund.invested,value:fund.value,pnl,returnPct:fund.invested?pnl/fund.invested*100:0,avg,ltp,previousClose:0,dayPnl:0,assetType:'MF',lots:[],mutualFund:fund};}
-function importedStockHolding_(stock, quotes){
-  const q=quotes && quotes[String(stock.symbol||'').toUpperCase()] ? quotes[String(stock.symbol||'').toUpperCase()] : null;
-  const ltp=q && Number(q.price)>0 ? Number(q.price) : Number(stock.ltp||0);
-  const value=ltp>0 ? Number(stock.qty||0)*ltp : Number(stock.value||0);
-  const invested=Number(stock.invested||0);
+function readImportedStocks_(){
+  const cached=cacheGetJson_(LEDGERLY_PERF.stocksKey);
+  if(cached)return cached;
+  const sh=getLedgerlySpreadsheet_().getSheetByName(SHEETS.stocks);
+  if(!sh||sh.getLastRow()<2)return [];
+  const out=sh.getRange(2,1,sh.getLastRow()-1,STOCK_HEADERS.length).getValues()
+    .filter(r=>r[0])
+    .map(r=>({
+      symbol:String(r[0]||''),
+      isin:String(r[1]||''),
+      qty:Number(r[2])||0,
+      avg:Number(r[3])||0,
+      invested:Number(r[4])||0,
+      ltp:Number(r[5])||0,
+      value:Number(r[6])||0,
+      pnl:Number(r[7])||0
+    }));
+  cachePutJson_(LEDGERLY_PERF.stocksKey,out,LEDGERLY_PERF.dataCacheSeconds);
+  return out;
+}
+function mutualFundHolding_(fund){
+  const symbol=fund.schemeName||fund.folioNo||'Mutual fund';
+  const qty=Number(fund.units||0);
+  const avg=qty?Number(fund.invested||0)/qty:0;
+  const value=Number(fund.value||0);
+  const invested=Number(fund.invested||0);
   const pnl=value-invested;
-  const previousClose=q ? Number(q.previousClose||0) : 0;
-  const dayPnl=(ltp>0&&previousClose>0)?Number(stock.qty||0)*(ltp-previousClose):0;
-  return {symbol:stock.symbol,displayName:stock.symbol,qty:Number(stock.qty||0),invested,value,pnl,returnPct:invested?pnl/invested*100:0,avg:Number(stock.avg||0),ltp,previousClose,dayPnl,assetType:'STOCK',lots:[],importedStock:stock};
+  return {symbol,displayName:fund.schemeName,qty,invested,value,pnl,returnPct:invested?pnl/invested*100:0,avg,ltp:qty?value/qty:0,previousClose:0,dayPnl:0,assetType:'MF',lots:[],mutualFund:fund};
 }
+function importedStockHolding_(stock,quotes){
+  const key=String(stock.symbol||'').toUpperCase();
+  const q=quotes&&quotes[key]?quotes[key]:null;
+  const ltp=q&&Number(q.price)>0?Number(q.price):Number(stock.ltp||0);
+  const qty=Number(stock.qty||0);
+  const invested=Number(stock.invested||0);
+  const value=ltp>0?qty*ltp:Number(stock.value||0);
+  const pnl=value-invested;
+  const previousClose=q?Number(q.previousClose||0):0;
+  const dayPnl=(ltp>0&&previousClose>0)?qty*(ltp-previousClose):0;
+  return {symbol:stock.symbol,displayName:stock.symbol,qty,invested,value,pnl,returnPct:invested?pnl/invested*100:0,avg:Number(stock.avg||0),ltp,previousClose,dayPnl,assetType:'STOCK',lots:[],importedStock:stock};
+}
+function readSnapshots_(){const cached=cacheGetJson_(LEDGERLY_PERF.snapshotsKey);if(cached)return cached;const sh=getLedgerlySpreadsheet_().getSheetByName(SHEETS.snapshots);if(!sh||sh.getLastRow()<2)return [];const out=sh.getRange(2,1,sh.getLastRow()-1,4).getValues().filter(r=>r[0]).map(r=>({date:formatDate_(r[0]),value:Number(r[1]),invested:Number(r[2]),pnl:Number(r[3])}));cachePutJson_(LEDGERLY_PERF.snapshotsKey,out,LEDGERLY_PERF.dataCacheSeconds);return out;}
 function importData_(kind, rows){if(kind==='stocks')return importStocks_(rows);if(kind==='mutualFunds')return importMutualFunds_(rows);throw new Error('Unsupported import type.');}
 function updateHolding_(input){
   const kind=String(input.kind||'');
@@ -470,6 +483,7 @@ function importStocks_(rows){
   if(!clean.length)throw new Error('No stock rows found. Check the header names and data.');
   if(sh.getLastRow()>1)sh.getRange(2,1,sh.getLastRow()-1,STOCK_HEADERS.length).clearContent();
   sh.getRange(2,1,clean.length,STOCK_HEADERS.length).setValues(clean);
+  cacheRemove_(LEDGERLY_PERF.stocksKey);invalidateLedgerlyCaches_();
   return {ok:true,count:clean.length,stocks:readImportedStocks_()};
 }
 function importMutualFunds_(rows){
@@ -481,6 +495,7 @@ function importMutualFunds_(rows){
   if(!clean.length)throw new Error('No mutual fund rows found. Check the header names and data.');
   if(sh.getLastRow()>1)sh.getRange(2,1,sh.getLastRow()-1,MUTUAL_FUND_HEADERS.length).clearContent();
   sh.getRange(2,1,clean.length,MUTUAL_FUND_HEADERS.length).setValues(clean);
+  cacheRemove_(LEDGERLY_PERF.mfKey);invalidateLedgerlyCaches_();
   return {ok:true,count:clean.length,mutualFunds:readMutualFunds_()};
 }
 function upsertQuote_(input){
@@ -494,76 +509,23 @@ function saveSnapshot_(input){const sh=getLedgerlySpreadsheet_().getSheetByName(
 /** Refresh all currently held STOCK symbols using GoogleFinance formulas.
  * Google documents the price quote as real-time but delayed by up to 20 minutes.
  */
-function buildInvestmentView_(quotes) {
-  const transactions = readTransactions_();
-  const calc = calculate_(transactions, quotes);
-  const mutualFunds = readMutualFunds_();
-  const importedStocks = readImportedStocks_();
-  const transactionSymbols = new Set(calc.holdings.map(h => String(h.symbol||'').toUpperCase()));
-  const importedMfHoldings = mutualFunds
-    .filter(f => !transactionSymbols.has(String(f.schemeName||f.folioNo||'').toUpperCase()))
-    .map(mutualFundHolding_);
-  const importedStockHoldings = importedStocks
-    .filter(s => !transactionSymbols.has(String(s.symbol||'').toUpperCase()))
-    .map(s => importedStockHolding_(s, quotes));
-  const holdings = calc.holdings.concat(importedMfHoldings, importedStockHoldings).sort((a,b)=>b.value-a.value);
-  const invested = holdings.reduce((sum,h)=>sum+Number(h.invested||0),0);
-  const value = holdings.reduce((sum,h)=>sum+Number(h.value||0),0);
-  const todayPnl = holdings.reduce((sum,h)=>sum+Number(h.dayPnl||0),0);
-  return {
-    holdings,
-    importedHoldings:{mutualFunds:importedMfHoldings,stocks:importedStockHoldings},
-    totals:{
-      invested,
-      value,
-      pnl:value-invested,
-      returnPct:invested?(value-invested)/invested*100:0,
-      realized:calc.realized,
-      todayPnl
-    }
-  };
-}
-
 function refreshLiveQuotes_(){
-  const status=getMarketStatus_(), txs=readTransactions_(), activeLots=calculateAllLots_();
-  const importedStockSymbols=readImportedStocks_().map(s=>String(s.symbol||'').toUpperCase()).filter(Boolean);
-  const stockSymbols=new Set(txs.filter(t=>t.assetType==='STOCK').map(t=>t.symbol).concat(importedStockSymbols));
-  const activeTransactionSymbols=activeLots.filter(l=>l.remainingQty>1e-9 && stockSymbols.has(l.symbol)).map(l=>l.symbol);
-  const symbols=[...new Set(activeTransactionSymbols.concat(importedStockSymbols))];
-  if(!symbols.length)return {ok:true,quotes:readQuotes_(),market:status,updated:0,message:'No stock holdings to refresh.'};
-  const ss=getLedgerlySpreadsheet_(), tempName='_LedgerlyLiveQuotes';
-  let temp=ss.getSheetByName(tempName); if(!temp)temp=ss.insertSheet(tempName); temp.clear();
-  temp.getRange(1,1,1,4).setValues([['Symbol','LTP','Previous Close','Trade Time']]);
-  temp.getRange(2,1,symbols.length,1).setValues(symbols.map(s=>[s]));
-  for(let i=0;i<symbols.length;i++){
-    const r=i+2;
-    temp.getRange(r,2).setFormula(`=IFERROR(GOOGLEFINANCE("NSE:${symbols[i]}","price"),"")`);
-    temp.getRange(r,3).setFormula(`=IFERROR(GOOGLEFINANCE("NSE:${symbols[i]}","closeyest"),"")`);
-    temp.getRange(r,4).setFormula(`=IFERROR(GOOGLEFINANCE("NSE:${symbols[i]}","tradetime"),"")`);
-  }
-  SpreadsheetApp.flush(); Utilities.sleep(1500);
-  const rows=temp.getRange(2,1,symbols.length,4).getValues(), quoteSheet=ss.getSheetByName(SHEETS.quotes);
-  const existing=quoteSheet.getDataRange().getValues(); let updated=0;
-  rows.forEach(r=>{
-    const symbol=String(r[0]).toUpperCase(), price=Number(r[1]), prev=Number(r[2]);
-    if(!(price>0))return;
-    let found=false;
-    for(let i=1;i<existing.length;i++)if(String(existing[i][0]).toUpperCase()===symbol){quoteSheet.getRange(i+1,1,1,4).setValues([[symbol,price,prev||Number(existing[i][2]||0),new Date()]]);found=true;break;}
-    if(!found)quoteSheet.appendRow([symbol,price,prev||0,new Date()]); updated++;
-  });
-  const refreshedQuotes = readQuotes_();
-  const investmentView = buildInvestmentView_(refreshedQuotes);
-  return {
-    ok:true,
-    quotes:refreshedQuotes,
-    market:getMarketStatus_(),
-    updated,
-    holdings:investmentView.holdings,
-    totals:investmentView.totals,
-    importedHoldings:investmentView.importedHoldings,
-    source:'GoogleFinance / NSE',
-    delay:'Up to 20 minutes'
-  };
+  const last=Number(PropertiesService.getScriptProperties().getProperty(LEDGERLY_PERF.refreshKey)||0),now=Date.now();
+  if(last&&now-last<LEDGERLY_PERF.quoteCacheSeconds*1000)return {ok:true,quotes:readQuotes_(),market:getMarketStatus_(),updated:0,cached:true,message:'Recent quote refresh already available.'};
+  const status=getMarketStatus_(),txs=readTransactions_(),quotes=readQuotes_(),calc=calculate_(txs,quotes);
+  const imported=readImportedStocks_().map(s=>String(s.symbol||'').toUpperCase()).filter(Boolean);
+  const active=calc.holdings.filter(h=>['STOCK','EQUITY','ETF'].includes(h.assetType)&&Number(h.qty)>1e-9).map(h=>h.symbol);
+  const symbols=[...new Set(active.concat(imported))];
+  if(!symbols.length)return {ok:true,quotes,market:status,updated:0,message:'No stock holdings to refresh.'};
+  const ss=getLedgerlySpreadsheet_(),tempName='_LedgerlyLiveQuotes';let temp=ss.getSheetByName(tempName);if(!temp)temp=ss.insertSheet(tempName);temp.clear();
+  temp.getRange(1,1,1,4).setValues([['Symbol','LTP','Previous Close','Trade Time']]);temp.getRange(2,1,symbols.length,1).setValues(symbols.map(s=>[s]));
+  temp.getRange(2,2,symbols.length,3).setFormulas(symbols.map(symbol=>[`=IFERROR(GOOGLEFINANCE("NSE:${symbol}","price"),"")`,`=IFERROR(GOOGLEFINANCE("NSE:${symbol}","closeyest"),"")`,`=IFERROR(GOOGLEFINANCE("NSE:${symbol}","tradetime"),"")`]));
+  SpreadsheetApp.flush();Utilities.sleep(1500);
+  const rows=temp.getRange(2,1,symbols.length,4).getValues(),quoteSheet=ss.getSheetByName(SHEETS.quotes);const existing=quoteSheet.getDataRange().getValues();const map={};for(let i=1;i<existing.length;i++)map[String(existing[i][0]).toUpperCase()]=i-1;
+  const out=existing.slice(1).map(r=>r.slice(0,4));let updated=0;rows.forEach(r=>{const symbol=String(r[0]).toUpperCase(),price=Number(r[1]),prev=Number(r[2]);if(!(price>0))return;const row=[symbol,price,prev||Number(quotes[symbol]?.previousClose||0),new Date()];if(map[symbol]!==undefined)out[map[symbol]]=row;else out.push(row);updated++;});
+  if(quoteSheet.getLastRow()>1)quoteSheet.getRange(2,1,quoteSheet.getLastRow()-1,4).clearContent();if(out.length)quoteSheet.getRange(2,1,out.length,4).setValues(out);
+  cacheRemove_(LEDGERLY_PERF.quotesKey);PropertiesService.getScriptProperties().setProperty(LEDGERLY_PERF.refreshKey,String(now));invalidateLedgerlyCaches_();
+  return {ok:true,quotes:readQuotes_(),market:getMarketStatus_(),updated,source:'GoogleFinance / NSE',delay:'Up to 20 minutes'};
 }
 
 function getMarketStatus_(){

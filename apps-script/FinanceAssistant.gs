@@ -42,6 +42,17 @@ const CONFIG = {
 
 const CACHE_KEY = "finance_config_v81";
 
+// Performance layer: month-level transaction cache + materialized bank balances.
+// Google Sheets I/O is the expensive part of this API, so read-heavy dashboard
+// requests should normally be served from CacheService rather than rescanning sheets.
+const LEDGERLY_PERF = {
+  transactionCacheSeconds: 300,
+  bankCacheSeconds: 300,
+  analyticsCacheSeconds: 120,
+  txPrefix: "finance_tx_v81_",
+  bankKey: "finance_bank_v81"
+};
+
 /* =========================================================
  * HTTP ENTRY POINTS
  * ========================================================= */
@@ -121,7 +132,7 @@ function setupFinanceSheets() {
   invalidateConfigCache_();
 
   return "Finance sheets ready.";
-}``
+}
 
 function upgradeFinanceShorthandAliases() {
   const ss = getSpreadsheet_();
@@ -243,9 +254,9 @@ function installFinanceConfigTriggers() {
 
 function onFinanceConfigEdit(e) {
   if (!e || !e.range) return;
-  if (isConfigSheet_(e.range.getSheet().getName())) {
-    invalidateConfigCache_();
-  }
+  const sheetName = e.range.getSheet().getName();
+  if (isConfigSheet_(sheetName)) invalidateConfigCache_();
+  if (sheetName === LEDGERLY_BRIDGE.bankSheet) invalidateFinanceAnalyticsCache_();
 }
 
 function onFinanceConfigChange() {
@@ -375,6 +386,9 @@ function addTransactions_(expenses, source) {
 
   try {
     const cfg = getConfig_();
+    // Ensure the materialized bank-balance column exists before this write.
+    // This prevents the first transaction after migration from being counted twice.
+    try { ensureBankBalancesMaterialized_(); } catch (_) {}
     const now = new Date();
     const defaultSource =
       clean_(source) ||
@@ -434,7 +448,9 @@ function addTransactions_(expenses, source) {
       appendTransactions_(month, grouped[month]);
     });
 
-    updateMonthlySummary_(Object.keys(grouped));
+    updateMonthlySummaryIncremental_(accepted);
+    applyBankBalanceDeltas_(accepted, 1);
+    invalidateFinanceAnalyticsCache_();
 
     const added = accepted.length;
     const failed = results.filter(r => r.status === "failed").length;
@@ -777,6 +793,8 @@ function appendTransactions_(month, transactions) {
     rows.length,
     lastColumn
   ).setValues(rows);
+
+  invalidateFinanceMonthCache_(month);
 }
 
 /* =========================================================
@@ -822,26 +840,42 @@ function findDuplicate_(tx, cfg) {
  * ========================================================= */
 
 function readTransactions_(months) {
-  const ss = getSpreadsheet_();
+  const requested = Array.isArray(months) ? months.filter(Boolean).map(String) : [];
+  if (!requested.length) return [];
+
+  const cache = CacheService.getScriptCache();
   const output = [];
+  const missing = [];
 
-  (months || []).forEach(month => {
+  requested.forEach(month => {
+    const key = LEDGERLY_PERF.txPrefix + month;
+    const cached = cache.get(key);
+    if (cached !== null) {
+      try {
+        const rows = JSON.parse(cached);
+        if (Array.isArray(rows)) output.push.apply(output, rows);
+        return;
+      } catch (_) {}
+    }
+    missing.push(month);
+  });
+
+  if (!missing.length) return output;
+
+  const ss = getSpreadsheet_();
+  missing.forEach(month => {
     const sh = ss.getSheetByName(month);
-
-    if (!sh || sh.getLastRow() < 2) return;
+    if (!sh || sh.getLastRow() < 2) {
+      cache.put(LEDGERLY_PERF.txPrefix + month, "[]", LEDGERLY_PERF.transactionCacheSeconds);
+      return;
+    }
 
     const lastColumn = sh.getLastColumn();
-
-    const headers = sh.getRange(
-      1, 1, 1, lastColumn
-    ).getValues()[0].map(v => String(v).trim());
-
+    const headers = sh.getRange(1, 1, 1, lastColumn).getValues()[0].map(v => String(v).trim());
     const map = {};
     headers.forEach((h, i) => map[h] = i);
-
-    const values = sh.getRange(
-      2, 1, sh.getLastRow() - 1, lastColumn
-    ).getValues();
+    const values = sh.getRange(2, 1, sh.getLastRow() - 1, lastColumn).getValues();
+    const monthRows = [];
 
     values.forEach(row => {
       const tx = {
@@ -861,12 +895,27 @@ function readTransactions_(months) {
         source: clean_(getCell_(row, map, "Source")),
         toAccount: clean_(getCell_(row, map, "To Account"))
       };
-
-      if (tx.id || tx.amount) output.push(tx);
+      if (tx.id || tx.amount) monthRows.push(tx);
     });
+
+    // CacheService entries have a size limit; skip caching unusually large months.
+    const serialized = JSON.stringify(monthRows);
+    if (serialized.length < 95000) {
+      try { cache.put(LEDGERLY_PERF.txPrefix + month, serialized, LEDGERLY_PERF.transactionCacheSeconds); } catch (_) {}
+    }
+    output.push.apply(output, monthRows);
   });
 
   return output;
+}
+
+function invalidateFinanceMonthCache_(month) {
+  if (!month) return;
+  try { CacheService.getScriptCache().remove(LEDGERLY_PERF.txPrefix + String(month)); } catch (_) {}
+}
+
+function invalidateFinanceAnalyticsCache_() {
+  try { CacheService.getScriptCache().remove(LEDGERLY_PERF.bankKey); } catch (_) {}
 }
 
 /* =========================================================
@@ -1982,6 +2031,116 @@ function invalidateConfigCache_() {
  * MONTHLY SUMMARY
  * ========================================================= */
 
+function updateMonthlySummaryIncremental_(transactions) {
+  if (!transactions || !transactions.length) return;
+  const ss = getSpreadsheet_();
+  const sh = ss.getSheetByName(CONFIG.sheets.summary);
+  if (!sh) return;
+
+  const last = sh.getLastRow();
+  const width = 6;
+  const rows = last >= 2 ? sh.getRange(2, 1, last - 1, width).getValues() : [];
+  const rowMap = {};
+  rows.forEach((r, i) => rowMap[String(r[0])] = i + 2);
+
+  const deltas = {};
+  transactions.forEach(t => {
+    const m = String(t.month || t.date || "").slice(0, 7);
+    if (!m) return;
+    if (!deltas[m]) deltas[m] = {expenses:0, investments:0, cc:0, income:0};
+    const amount = Number(t.amount || 0);
+    if (same_(t.type, "Expense")) deltas[m].expenses += amount;
+    if (same_(t.type, "Investment") || same_(t.category, "Investments")) deltas[m].investments += amount;
+    if (same_(t.type, "Credit Card Payment")) deltas[m].cc += amount;
+    if (same_(t.type, "Income") || same_(t.type, "Refund")) deltas[m].income += amount;
+  });
+
+  Object.keys(deltas).forEach(month => {
+    const d = deltas[month];
+    if (rowMap[month]) {
+      const r = rowMap[month];
+      const current = sh.getRange(r, 2, 1, 4).getValues()[0];
+      sh.getRange(r, 2, 1, 5).setValues([[
+        Number(current[0]||0)+d.expenses,
+        Number(current[1]||0)+d.investments,
+        Number(current[2]||0)+d.cc,
+        Number(current[3]||0)+d.income,
+        new Date()
+      ]]);
+    } else {
+      sh.getRange(sh.getLastRow()+1, 1, 1, 6).setValues([[
+        month, roundMoney_(d.expenses), roundMoney_(d.investments),
+        roundMoney_(d.cc), roundMoney_(d.income), new Date()
+      ]]);
+    }
+  });
+}
+
+function ensureBankBalancesMaterialized_() {
+  const ss=getSpreadsheet_();
+  const sh=ss.getSheetByName(LEDGERLY_BRIDGE.bankSheet)||setupFinanceBankBalances_();
+  const values=sh.getDataRange().getValues();
+  if(values.length<2)return sh;
+  const headers=values[0].map(v=>String(v).trim());
+  const before=headers.indexOf("Current Balance");
+  const currentIdx=ensureBankCurrentBalanceColumn_(sh);
+  if(before>=0)return sh;
+  const accountIdx=headers.indexOf("Account"), openingIdx=headers.indexOf("Opening Balance"), adjustIdx=headers.indexOf("Manual Adjustment"), dateIdx=headers.indexOf("Opening Date"), activeIdx=headers.indexOf("Active");
+  const txs=readAllFinanceTransactions_();
+  values.slice(1).forEach((row,i)=>{
+    const name=String(row[accountIdx]||"").trim();if(!name)return;
+    const opening=Number(row[openingIdx]||0), adjustment=Number(row[adjustIdx]||0), openingDate=formatSheetDate_(row[dateIdx])||"1900-01-01";
+    let movement=0;txs.forEach(t=>{if(t.date<openingDate)return;bankDeltaForTransaction_(t).forEach(pair=>{if(same_(pair[0],name))movement+=Number(pair[1]||0);});});
+    sh.getRange(i+2,currentIdx+1).setValue(roundMoney_(opening+adjustment+movement));
+  });
+  return sh;
+}
+
+function ensureBankCurrentBalanceColumn_(sh) {
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(v => String(v).trim());
+  let idx = headers.indexOf("Current Balance");
+  if (idx >= 0) return idx;
+  idx = headers.length;
+  sh.getRange(1, idx + 1).setValue("Current Balance");
+  return idx;
+}
+
+function bankDeltaForTransaction_(t) {
+  const amount = Number(t.amount || 0);
+  if (!(amount > 0)) return [];
+  if (same_(t.type, "Income") || same_(t.type, "Refund")) return [[t.account, amount]];
+  if (same_(t.type, "Expense") || same_(t.type, "Investment") || same_(t.type, "Credit Card Payment")) return [[t.account, -amount]];
+  if (same_(t.type, "Transfer")) return [[t.account, -amount], [t.toAccount, amount]];
+  return [];
+}
+
+function applyBankBalanceDeltas_(transactions, direction) {
+  if (!transactions || !transactions.length) return;
+  const ss = getSpreadsheet_();
+  const sh = ss.getSheetByName(LEDGERLY_BRIDGE.bankSheet) || setupFinanceBankBalances_();
+  const currentIdx = ensureBankCurrentBalanceColumn_(sh);
+  const values = sh.getDataRange().getValues();
+  const headers = values[0].map(v => String(v).trim());
+  const accountIdx = headers.indexOf("Account");
+  const rowMap = {};
+  for (let i=1;i<values.length;i++) {
+    const name=String(values[i][accountIdx]||"").trim().toLowerCase();
+    if(name) rowMap[name]=i+1;
+  }
+  const deltas = {};
+  transactions.forEach(t => bankDeltaForTransaction_(t).forEach(pair => {
+    const name=String(pair[0]||"").trim().toLowerCase();
+    if(name) deltas[name]=(deltas[name]||0)+Number(pair[1]||0)*Number(direction||1);
+  }));
+  Object.keys(deltas).forEach(name => {
+    const row=rowMap[name];
+    if(!row) return;
+    const cell=sh.getRange(row,currentIdx+1);
+    const current=Number(cell.getValue()||0);
+    cell.setValue(roundMoney_(current+deltas[name]));
+  });
+}
+
 function updateMonthlySummary_(months) {
   const ss = getSpreadsheet_();
   const sh = ss.getSheetByName(CONFIG.sheets.summary);
@@ -2214,7 +2373,8 @@ function isConfigSheet_(name) {
     CONFIG.sheets.paymentModes,
     CONFIG.sheets.categories,
     CONFIG.sheets.merchantRules,
-    CONFIG.sheets.settings
+    CONFIG.sheets.settings,
+    LEDGERLY_BRIDGE.bankSheet
   ].indexOf(name) >= 0;
 }
 
@@ -3808,7 +3968,8 @@ function dashboardCardV84_(
  * ========================================================= */
 
 const LEDGERLY_BRIDGE = {
-  secretProperty: "1nw8QpT85epAlmAmtNf3yLZ8JrM5uOb3LqHSTgukcf2Q",
+  secretProperty: "LEDGERLY_BRIDGE_SECRET",
+  legacySecretProperty: "1nw8QpT85epAlmAmtNf3yLZ8JrM5uOb3LqHSTgukcf2Q",
   bankSheet: "BankBalances"
 };
 
@@ -3825,10 +3986,11 @@ function setLedgerlyBridgeSecret(secret) {
 }
 
 function getLedgerlyBridgeSecret_() {
+  const p=PropertiesService.getScriptProperties();
   return String(
-    PropertiesService.getScriptProperties().getProperty(
-      LEDGERLY_BRIDGE.secretProperty
-    ) || ""
+    p.getProperty(LEDGERLY_BRIDGE.secretProperty) ||
+    p.getProperty(LEDGERLY_BRIDGE.legacySecretProperty) ||
+    ""
   );
 }
 
@@ -3861,9 +4023,7 @@ function handleLedgerlyBridgePost_(body) {
   }
 
   if (action === "ledgerlyDeleteFinanceTransaction") {
-    return {
-      success: deleteFinanceTransactionById_(body.financeTransactionId)
-    };
+    return { success: deleteFinanceTransactionById_(body.financeTransactionId) };
   }
 
   if (action === "ledgerlyUpdateBankAccount") {
@@ -3912,63 +4072,25 @@ function setupFinanceBankBalances_() {
 }
 
 function getFinanceBankAccounts_() {
-  const ss = getSpreadsheet_();
-  const sh = ss.getSheetByName(LEDGERLY_BRIDGE.bankSheet) || setupFinanceBankBalances_();
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get(LEDGERLY_PERF.bankKey);
+  if (cached) { try { return JSON.parse(cached); } catch (_) {} }
+
+  const sh = ensureBankBalancesMaterialized_();
   const values = sh.getDataRange().getValues();
-  if (values.length < 2) return { accounts: [], total: 0 };
-
-  const headers = values[0].map(v => String(v).trim());
-  const idx = {};
-  headers.forEach((h, i) => idx[h] = i);
-
-  const txs = readAllFinanceTransactions_();
-  const cfg = getConfig_();
-  const configByName = {};
-  cfg.accounts.forEach(a => { configByName[String(a.name || "").toLowerCase()] = a; });
-  const accounts = [];
-
-  values.slice(1).forEach(row => {
-    const name = String(row[idx["Account"]] || "").trim();
-    if (!name || String(row[idx["Active"]]).toUpperCase() === "FALSE") return;
-
-    const opening = Number(row[idx["Opening Balance"]] || 0);
-    const adjustment = Number(row[idx["Manual Adjustment"]] || 0);
-    const openingDate = formatSheetDate_(row[idx["Opening Date"]]) || "1900-01-01";
-    let movement = 0;
-
-    txs.forEach(t => {
-      if (t.date < openingDate) return;
-
-      if (same_(t.account, name)) {
-        if (same_(t.type, "Income") || same_(t.type, "Refund")) movement += Number(t.amount || 0);
-        else if (same_(t.type, "Expense") || same_(t.type, "Investment") || same_(t.type, "Credit Card Payment")) movement -= Number(t.amount || 0);
-        else if (same_(t.type, "Transfer")) movement -= Number(t.amount || 0);
-      }
-
-      if (same_(t.type, "Transfer") && same_(t.toAccount, name)) {
-        movement += Number(t.amount || 0);
-      }
-    });
-
-    const configAccount = configByName[name.toLowerCase()] || {};
-    const currentBalance = roundMoney_(opening + adjustment + movement);
-    accounts.push({
-      account: name,
-      name: name,
-      type: String(configAccount.type || "Bank Account"),
-      balance: currentBalance,
-      openingBalance: opening,
-      openingDate: openingDate,
-      manualAdjustment: adjustment,
-      active: true,
-      notes: String(row[idx["Notes"]] || "")
-    });
+  if (values.length < 2) return {accounts: [], total: 0};
+  const headers = values[0].map(v=>String(v).trim());
+  const idx={}; headers.forEach((h,i)=>idx[h]=i);
+  const currentIdx=idx["Current Balance"];
+  const accounts=[];
+  values.slice(1).forEach(row=>{
+    const name=String(row[idx["Account"]]||"").trim();
+    if(!name||String(row[idx["Active"]]).toUpperCase()==="FALSE")return;
+    accounts.push({account:name,name:name,type:String(row[idx["Type"]]||"Bank Account"),balance:roundMoney_(Number(row[currentIdx]||0)),openingBalance:Number(row[idx["Opening Balance"]]||0),manualAdjustment:Number(row[idx["Manual Adjustment"]]||0)});
   });
-
-  return {
-    accounts,
-    total: roundMoney_(accounts.reduce((s, a) => s + a.balance, 0))
-  };
+  const result={accounts,total:roundMoney_(accounts.reduce((s,a)=>s+a.balance,0))};
+  try{cache.put(LEDGERLY_PERF.bankKey,JSON.stringify(result),LEDGERLY_PERF.bankCacheSeconds);}catch(_){}
+  return result;
 }
 
 function readAllFinanceTransactions_() {
@@ -3988,123 +4110,6 @@ function getFinanceCurrentMonthSummary_() {
 }
 
 
-
-function updateLedgerlyBankAccount_(body) {
-  const lock = LockService.getScriptLock();
-  lock.waitLock(20000);
-  try {
-    const oldName = String(body.account || body.accountName || "").trim();
-    const newName = String(body.name || oldName).trim();
-    if (!oldName) throw new Error("Existing bank account name is required.");
-    if (!newName) throw new Error("Bank account name is required.");
-
-    const ss = getSpreadsheet_();
-    const bankSheet = ss.getSheetByName(LEDGERLY_BRIDGE.bankSheet) || setupFinanceBankBalances_();
-    const bankValues = bankSheet.getDataRange().getValues();
-    const bankHeaders = bankValues[0].map(v => String(v).trim());
-    const bi = {}; bankHeaders.forEach((h,i) => bi[h] = i);
-    const accountCol = bi["Account"];
-    if (accountCol == null) throw new Error("BankBalances sheet is missing the Account column.");
-
-    let bankRow = -1;
-    for (let i = 1; i < bankValues.length; i++) {
-      if (same_(bankValues[i][accountCol], oldName)) { bankRow = i + 1; break; }
-    }
-    if (bankRow < 0) throw new Error("Bank account not found: " + oldName);
-
-    if (!same_(oldName, newName)) {
-      for (let i = 1; i < bankValues.length; i++) {
-        if (i + 1 !== bankRow && same_(bankValues[i][accountCol], newName)) {
-          throw new Error("A bank account with this name already exists: " + newName);
-        }
-      }
-    }
-
-    const row = bankSheet.getRange(bankRow, 1, 1, bankHeaders.length).getValues()[0];
-    const openingBalance = Number(body.openingBalance ?? row[bi["Opening Balance"]] ?? 0);
-    const openingDate = String(body.openingDate || formatSheetDate_(row[bi["Opening Date"]]) || "1900-01-01").trim();
-    const active = body.active === false ? false : true;
-    const notes = String(body.notes ?? row[bi["Notes"]] ?? "");
-
-    const txs = readAllFinanceTransactions_();
-    let movement = 0;
-    txs.forEach(t => {
-      if (t.date < openingDate) return;
-      if (same_(t.account, oldName)) {
-        if (same_(t.type, "Income") || same_(t.type, "Refund")) movement += Number(t.amount || 0);
-        else if (same_(t.type, "Expense") || same_(t.type, "Investment") || same_(t.type, "Credit Card Payment")) movement -= Number(t.amount || 0);
-        else if (same_(t.type, "Transfer")) movement -= Number(t.amount || 0);
-      }
-      if (same_(t.type, "Transfer") && same_(t.toAccount, oldName)) {
-        movement += Number(t.amount || 0);
-      }
-    });
-
-    const currentBalanceProvided = body.currentBalance !== undefined && body.currentBalance !== null && String(body.currentBalance) !== "";
-    const manualAdjustment = currentBalanceProvided
-      ? Number(body.currentBalance || 0) - openingBalance - movement
-      : Number(body.manualAdjustment ?? row[bi["Manual Adjustment"]] ?? 0);
-
-    // Update BankBalances in one row write.
-    const updated = row.slice();
-    updated[bi["Account"]] = newName;
-    updated[bi["Opening Balance"]] = openingBalance;
-    updated[bi["Opening Date"]] = openingDate;
-    updated[bi["Manual Adjustment"]] = roundMoney_(manualAdjustment);
-    updated[bi["Active"]] = active;
-    updated[bi["Notes"]] = notes;
-    bankSheet.getRange(bankRow, 1, 1, bankHeaders.length).setValues([updated]);
-
-    // Update the Finance Assistant account configuration so future transactions
-    // use the new name/type and the cached config is invalidated.
-    const accountsSheet = ss.getSheetByName(CONFIG.sheets.accounts);
-    let configUpdated = false;
-    if (accountsSheet && accountsSheet.getLastRow() >= 2) {
-      const lastCol = accountsSheet.getLastColumn();
-      const headers = accountsSheet.getRange(1,1,1,lastCol).getValues()[0].map(v => String(v).trim());
-      const ai = {}; headers.forEach((h,i) => ai[h] = i);
-      const vals = accountsSheet.getRange(2,1,accountsSheet.getLastRow()-1,lastCol).getValues();
-      for (let i = 0; i < vals.length; i++) {
-        if (same_(vals[i][ai["Account"]], oldName)) {
-          if (ai["Account"] != null) vals[i][ai["Account"]] = newName;
-          if (ai["Type"] != null) vals[i][ai["Type"]] = String(body.type || vals[i][ai["Type"]] || "Bank Account");
-          if (ai["Active"] != null) vals[i][ai["Active"]] = active ? "TRUE" : "FALSE";
-          accountsSheet.getRange(2,1,vals.length,lastCol).setValues(vals);
-          configUpdated = true;
-          break;
-        }
-      }
-    }
-
-    // Rename historical transaction references so the account's history remains
-    // attached to the renamed account instead of becoming orphaned.
-    if (!same_(oldName, newName)) {
-      const monthSheets = ss.getSheets().filter(sh => /^\d{4}-\d{2}$/.test(sh.getName()));
-      monthSheets.forEach(sh => {
-        if (sh.getLastRow() < 2) return;
-        const lastCol = sh.getLastColumn();
-        const headers = sh.getRange(1,1,1,lastCol).getValues()[0].map(v => String(v).trim());
-        const accountIndex = headers.indexOf("Account");
-        const toAccountIndex = headers.indexOf("To Account");
-        if (accountIndex < 0 && toAccountIndex < 0) return;
-        const vals = sh.getRange(2,1,sh.getLastRow()-1,lastCol).getValues();
-        let changed = false;
-        vals.forEach(r => {
-          if (accountIndex >= 0 && same_(r[accountIndex], oldName)) { r[accountIndex] = newName; changed = true; }
-          if (toAccountIndex >= 0 && same_(r[toAccountIndex], oldName)) { r[toAccountIndex] = newName; changed = true; }
-        });
-        if (changed) sh.getRange(2,1,vals.length,lastCol).setValues(vals);
-      });
-    }
-
-    CacheService.getScriptCache().remove(CACHE_KEY);
-    const bank = getFinanceBankAccounts_();
-    const saved = bank.accounts.find(a => same_(a.account, newName));
-    return {success:true,account:saved||null,bankTotal:bank.total,configUpdated};
-  } finally {
-    lock.releaseLock();
-  }
-}
 
 function addLedgerlyCashFlow_(body) {
   const type = String(body.financeType || "").trim();
@@ -4151,29 +4156,89 @@ function addLedgerlyCashFlow_(body) {
 function deleteFinanceTransactionById_(id) {
   id = String(id || "").trim();
   if (!id) throw new Error("Finance transaction ID is required.");
-
   const ss = getSpreadsheet_();
   const monthSheets = ss.getSheets().map(s => s.getName()).filter(n => /^\d{4}-\d{2}$/.test(n));
 
   for (const name of monthSheets) {
     const sh = ss.getSheetByName(name);
     if (!sh || sh.getLastRow() < 2) continue;
-
-    const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(v => String(v).trim());
-    const idCol = headers.indexOf("ID");
-    if (idCol < 0) continue;
-
-    const values = sh.getRange(2, idCol + 1, sh.getLastRow() - 1, 1).getValues();
-    for (let i = 0; i < values.length; i++) {
-      if (String(values[i][0]) === id) {
-        sh.deleteRow(i + 2);
-        updateMonthlySummary_([name]);
-        return true;
-      }
+    const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(v=>String(v).trim());
+    const idx={}; headers.forEach((h,i)=>idx[h]=i);
+    const values=sh.getRange(2,1,sh.getLastRow()-1,sh.getLastColumn()).getValues();
+    for(let i=0;i<values.length;i++){
+      if(String(values[i][idx["ID"]])!==id)continue;
+      const r=values[i];
+      const tx={
+        id, date:formatSheetDate_(r[idx["Date"]]), month:clean_(r[idx["Month"]])||name,
+        type:clean_(r[idx["Type"]]), category:clean_(r[idx["Category"]]), amount:parseAmount_(r[idx["Amount"]]),
+        account:clean_(r[idx["Account"]]), toAccount:clean_(r[idx["To Account"]])
+      };
+      sh.deleteRow(i+2);
+      invalidateFinanceMonthCache_(name);
+      applyBankBalanceDeltas_([tx],-1);
+      updateMonthlySummaryIncremental_([Object.assign({},tx,{amount:-Number(tx.amount||0)})]);
+      invalidateFinanceAnalyticsCache_();
+      return true;
     }
   }
-
   return false;
+}
+
+function updateLedgerlyBankAccount_(body) {
+  const oldName=String(body.account||body.accountName||body.id||body.accountId||"").trim();
+  const newName=String(body.name||body.accountName||oldName).trim();
+  if(!oldName||!newName)throw new Error("Bank account name is required.");
+  const ss=getSpreadsheet_();
+  const sh=ss.getSheetByName(LEDGERLY_BRIDGE.bankSheet)||setupFinanceBankBalances_();
+  const currentIdx=ensureBankCurrentBalanceColumn_(sh);
+  const values=sh.getDataRange().getValues();
+  const headers=values[0].map(v=>String(v).trim()); const idx={}; headers.forEach((h,i)=>idx[h]=i);
+  let rowNo=0;
+  for(let i=1;i<values.length;i++)if(same_(values[i][idx["Account"]],oldName)){rowNo=i+1;break;}
+  if(!rowNo)throw new Error("Bank account not found: "+oldName);
+  for(let i=1;i<values.length;i++)if(i+1!==rowNo&&same_(values[i][idx["Account"]],newName))throw new Error("An account with this name already exists: "+newName);
+
+  const row=sh.getRange(rowNo,1,1,sh.getLastColumn()).getValues()[0];
+  const opening=Number(body.openingBalance!==undefined?body.openingBalance:row[idx["Opening Balance"]]||0);
+  const openingDate=String(body.openingDate||formatSheetDate_(row[idx["Opening Date"]])||"").trim();
+  const active=body.active===undefined?String(row[idx["Active"]]).toUpperCase()!=="FALSE":body.active!==false;
+  const notes=body.notes!==undefined?String(body.notes||""):String(row[idx["Notes"]]||"");
+  const type=String(body.type||"Bank Account").trim();
+
+  const txs=readAllFinanceTransactions_();
+  let movement=0;
+  txs.forEach(t=>{
+    if(openingDate&&t.date<openingDate)return;
+    bankDeltaForTransaction_(t).forEach(pair=>{if(same_(pair[0],oldName))movement+=Number(pair[1]||0);});
+  });
+  const currentBalance=Number(body.currentBalance!==undefined?body.currentBalance:body.balance!==undefined?body.balance:row[currentIdx]||0);
+  const manualAdjustment=roundMoney_(currentBalance-opening-movement);
+
+  row[idx["Account"]]=newName;
+  if(idx["Opening Balance"]>=0)row[idx["Opening Balance"]]=opening;
+  if(idx["Opening Date"]>=0)row[idx["Opening Date"]]=openingDate||row[idx["Opening Date"]];
+  if(idx["Manual Adjustment"]>=0)row[idx["Manual Adjustment"]]=manualAdjustment;
+  if(idx["Active"]>=0)row[idx["Active"]]=active;
+  if(idx["Notes"]>=0)row[idx["Notes"]]=notes;
+  row[currentIdx]=currentBalance;
+  sh.getRange(rowNo,1,1,sh.getLastColumn()).setValues([row]);
+
+  // Keep historical transaction account references consistent after a rename.
+  if(!same_(oldName,newName)){
+    const months=ss.getSheets().map(s=>s.getName()).filter(n=>/^\\d{4}-\\d{2}$/.test(n));
+    months.forEach(month=>{
+      const txsh=ss.getSheetByName(month); if(!txsh||txsh.getLastRow()<2)return;
+      const hdr=txsh.getRange(1,1,1,txsh.getLastColumn()).getValues()[0].map(v=>String(v).trim());
+      const a=hdr.indexOf("Account"),to=hdr.indexOf("To Account");
+      if(a<0)return;
+      const vals=txsh.getRange(2,1,txsh.getLastRow()-1,txsh.getLastColumn()).getValues(); let changed=false;
+      vals.forEach(r=>{if(same_(r[a],oldName)){r[a]=newName;changed=true;}if(to>=0&&same_(r[to],oldName)){r[to]=newName;changed=true;}});
+      if(changed)txsh.getRange(2,1,vals.length,txsh.getLastColumn()).setValues(vals);
+      invalidateFinanceMonthCache_(month);
+    });
+  }
+  invalidateFinanceAnalyticsCache_();
+  return {success:true,account:{account:newName,name:newName,type,balance:roundMoney_(currentBalance),openingBalance:opening,manualAdjustment,openingDate,active,notes},bankTotal:getFinanceBankAccounts_().total};
 }
 
 
@@ -4181,95 +4246,57 @@ function getLedgerlyDashboardData_(payload) {
   payload = payload || {};
   const period = String(payload.period || "this-month");
   const range = resolveLedgerlyPeriod_(period);
-  const months = monthsBetween_(range.start, range.end);
+  const selectedMonths = monthsBetween_(range.start, range.end);
+  const txs = readTransactions_(selectedMonths).filter(t => withinDateRange_(t.date, range.start, range.end));
+  const expenses=txs.filter(t=>same_(t.type,"Expense"));
+  const income=txs.filter(t=>same_(t.type,"Income")||same_(t.type,"Refund"));
+  const investments=txs.filter(t=>same_(t.type,"Investment")||same_(t.category,"Investments"));
+  const ccPayments=txs.filter(t=>same_(t.type,"Credit Card Payment"));
+  const sum=rows=>roundMoney_(rows.reduce((s,t)=>s+Number(t.amount||0),0));
+  const incomeTotal=sum(income), spendingTotal=sum(expenses), investmentTotal=sum(investments), ccPaymentTotal=sum(ccPayments);
 
-  const txs = readTransactions_(months)
-    .filter(t => withinDateRange_(t.date, range.start, range.end));
-
-  const expenses = txs.filter(t => same_(t.type, "Expense"));
-  const income = txs.filter(t => same_(t.type, "Income"));
-  const investments = txs.filter(t =>
-    same_(t.type, "Investment") ||
-    same_(t.category, "Investments")
-  );
-  const ccPayments = txs.filter(t => same_(t.type, "Credit Card Payment"));
-
-  const sumAmount = rows => roundMoney_(
-    rows.reduce((s, t) => s + Number(t.amount || 0), 0)
-  );
-
-  const incomeTotal = sumAmount(income);
-  const spendingTotal = sumAmount(expenses);
-  const investmentTotal = sumAmount(investments);
-  const ccPaymentTotal = sumAmount(ccPayments);
-
+  // Reuse the single selected-period read for all selected-period analytics.
+  const grouped={};
+  txs.forEach(t=>{const m=String(t.month||t.date||"").slice(0,7);if(m)(grouped[m]||(grouped[m]=[])).push(t);});
+  const monthlyFromMap=months=>months.map(month=>{
+    const rows=grouped[month]||[];
+    const inc=sum(rows.filter(t=>same_(t.type,"Income")||same_(t.type,"Refund")));
+    const sp=sum(rows.filter(t=>same_(t.type,"Expense")));
+    const inv=sum(rows.filter(t=>same_(t.type,"Investment")||same_(t.category,"Investments")));
+    return {month,income:inc,spending:sp,investments:inv,netCashFlow:roundMoney_(inc-sp-inv)};
+  });
+  const recent=txs.slice().sort((a,b)=>String(b.date).localeCompare(String(a.date))||String(b.time||"").localeCompare(String(a.time||""))).slice(0,100);
+  const largest=expenses.slice().sort((a,b)=>Number(b.amount||0)-Number(a.amount||0)).slice(0,10);
+  const bank=getFinanceBankAccounts_();
   return {
-    connected: true,
-    period: {
-      key: period,
-      start: range.start,
-      end: range.end
-    },
-
-    income: incomeTotal,
-    spending: spendingTotal,
-    investments: investmentTotal,
-    creditCardPayments: ccPaymentTotal,
-
-    netSavings: roundMoney_(incomeTotal - spendingTotal),
-    cashFlowAfterInvestments: roundMoney_(
-      incomeTotal - spendingTotal - investmentTotal
-    ),
-    savingsRate: incomeTotal
-      ? roundMoney_((incomeTotal - spendingTotal) / incomeTotal * 100)
-      : 0,
-
-    transactionCount: txs.length,
-    // Full Finance Assistant transaction history for the selected period.
-    // recentTransactions remains a lightweight dashboard preview.
-    financeTransactions: txs,
-
-    bankAccounts: getFinanceBankAccounts_().accounts,
-    bankTotal: roundMoney_(getFinanceBankAccounts_().total),
-
-    categorySpending: ledgerlyGroupExpenses_(
-      expenses,
-      "category",
-      "amount"
-    ),
-
-    merchantSpending: ledgerlyGroupExpenses_(
-      expenses,
-      "merchant",
-      "amount"
-    ),
-
-    paymentModeSpending: ledgerlyGroupExpenses_(
-      expenses,
-      "paymentMode",
-      "amount"
-    ),
-
-    monthly: ledgerlyMonthlyBreakdown_(months),
-
-    // Rolling 12-month comparison is kept separate from the selected-period totals.
-    monthlyTrend: ledgerlyMonthlyTrend_(),
-
-    recentTransactions: txs
-      .slice()
-      .sort((a, b) =>
-        String(b.date).localeCompare(String(a.date)) ||
-        String(b.time || "").localeCompare(String(a.time || ""))
-      )
-      .slice(0, 100),
-
-    largestExpenses: expenses
-      .slice()
-      .sort((a, b) => Number(b.amount || 0) - Number(a.amount || 0))
-      .slice(0, 10),
-
-    lastUpdatedAt: new Date().toISOString()
+    connected:true, period:{key:period,start:range.start,end:range.end}, income:incomeTotal, spending:spendingTotal,
+    investments:investmentTotal, creditCardPayments:ccPaymentTotal,
+    netSavings:roundMoney_(incomeTotal-spendingTotal), cashFlowAfterInvestments:roundMoney_(incomeTotal-spendingTotal-investmentTotal),
+    savingsRate:incomeTotal?roundMoney_((incomeTotal-spendingTotal)/incomeTotal*100):0,
+    transactionCount:txs.length, financeTransactions:txs,
+    bankAccounts:bank.accounts, bankTotal:bank.total,
+    categorySpending:ledgerlyGroupExpenses_(expenses,"category","amount"),
+    merchantSpending:ledgerlyGroupExpenses_(expenses,"merchant","amount"),
+    paymentModeSpending:ledgerlyGroupExpenses_(expenses,"paymentMode","amount"),
+    monthly:monthlyFromMap(selectedMonths), monthlyTrend:ledgerlyMonthlyTrend_(),
+    recentTransactions:recent, largestExpenses:largest, lastUpdatedAt:new Date().toISOString()
   };
+}
+
+function ledgerlyMonthlyTrend_(){
+  const ss=getSpreadsheet_();
+  const sh=ss.getSheetByName(CONFIG.sheets.summary);
+  if(!sh||sh.getLastRow()<2){
+    const tz=ss.getSpreadsheetTimeZone()||Session.getScriptTimeZone()||"Asia/Kolkata",today=new Date(),months=[];
+    for(let i=11;i>=0;i--){const d=new Date(today.getFullYear(),today.getMonth()-i,1);months.push(Utilities.formatDate(d,tz,"yyyy-MM"));}
+    return ledgerlyMonthlyBreakdown_(months);
+  }
+  const rows=sh.getRange(2,1,sh.getLastRow()-1,6).getValues();
+  const map={};
+  rows.forEach(r=>{const month=String(r[0]||"").slice(0,7);if(month)map[month]={month,spending:Number(r[1]||0),investments:Number(r[2]||0),income:Number(r[4]||0)};});
+  const tz=ss.getSpreadsheetTimeZone()||Session.getScriptTimeZone()||"Asia/Kolkata",today=new Date(),out=[];
+  for(let i=11;i>=0;i--){const d=new Date(today.getFullYear(),today.getMonth()-i,1),month=Utilities.formatDate(d,tz,"yyyy-MM"),r=map[month]||{month,spending:0,investments:0,income:0};out.push({month,income:roundMoney_(r.income),spending:roundMoney_(r.spending),investments:roundMoney_(r.investments),netCashFlow:roundMoney_(r.income-r.spending-r.investments)});}
+  return out;
 }
 
 function resolveLedgerlyPeriod_(period) {
