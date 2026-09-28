@@ -593,52 +593,120 @@ function normalizeTransaction_(raw, cfg, now, source) {
   }
 
   /*
-   * 6. Credit-card bill detection.
-   *
-   * "337 dinner using BOB CC" = normal Expense.
-   * "13204 pay BOB CC bill using UPI" = Credit Card Payment.
+ * 6. CREDIT CARD BILL PAYMENT
+ *
+ * A credit-card bill payment has:
+ *
+ *   type         = Credit Card Payment
+ *   category     = Financial
+ *   subcategory  = Credit Card Bill
+ *   paymentMode  = how the bill was paid
+ *   toAccount    = credit card whose bill was paid
+ */
+
+if (looksLikeCreditCardBill_(lower)) {
+
+  type = "Credit Card Payment";
+  category = "Financial";
+  subcategory = "Credit Card Bill";
+
+  /*
+   * The credit card mentioned in the bill-payment text
+   * is ALWAYS the destination.
    */
-  if (looksLikeCreditCardBill_(lower)) {
-    type = "Credit Card Payment";
-    category = "Financial";
-    subcategory = "Credit Card Bill";
+  const destinationCard =
+    resolveCreditCardDestination_(
+      input.to_account,
+      lower,
+      cfg
+    );
 
-    const destinationCard =
-      resolveCreditCardDestination_(input.to_account, lower, cfg);
-
-    if (destinationCard) {
-      toAccount = destinationCard;
-    }
-
-    const sourceMethod =
-      resolvePaymentMethodFromBillText_(lower, cfg);
-
-    if (sourceMethod) {
-      paymentMode = sourceMethod;
-    } else {
-      // Never guess the method for a bill payment.
-      paymentMode = resolvePaymentMode_(
-        input.payment_mode,
-        lower,
-        cfg
-      );
-    }
-
-  } else {
-    /*
-     * Normal expense:
-     * a credit card is a payment method, not To Account.
-     */
-    if (toAccount && isCreditCardAccount_(toAccount, cfg)) {
-      if (!paymentMode) paymentMode = toAccount;
-      toAccount = "";
-    }
-
-    const cardFromText = resolveCreditCardFromText_(lower, cfg);
-    if (cardFromText) {
-      paymentMode = cardFromText;
-    }
+  if (destinationCard) {
+    toAccount = destinationCard;
   }
+
+/*
+ * Determine HOW the credit-card bill was paid.
+ *
+ * IMPORTANT:
+ * For bill payments, payment_mode means the actual
+ * source used to pay the bill.
+ *
+ * Example:
+ *
+ * "Spent 67515 to pay SBI CC bill using UPI"
+ *
+ * payment_mode = UPI
+ * to_account   = SBI Credit Card
+ *
+ * The AI already provides payment_mode when available,
+ * so prefer that first. This prevents the combined
+ * transaction text from accidentally matching the
+ * credit card itself.
+ */
+
+/*
+ * 1. Prefer the AI's structured payment_mode.
+ */
+let sourceMethod = "";
+
+if (input.payment_mode) {
+  sourceMethod = clean_(input.payment_mode);
+}
+
+/*
+ * 2. If AI did not provide payment_mode,
+ *    try deterministic parsing from the source text.
+ */
+if (!sourceMethod) {
+  sourceMethod =
+    resolvePaymentMethodFromBillText_(
+      lower,
+      cfg
+    );
+}
+
+/*
+ * 3. Explicit deterministic fallback.
+ */
+if (!sourceMethod && /\bupi\b/i.test(lower)) {
+  sourceMethod = "UPI";
+}
+
+if (!sourceMethod && /\bcash\b/i.test(lower)) {
+  sourceMethod = "Cash";
+}
+
+paymentMode = sourceMethod || "";
+
+} else {
+
+  /*
+   * Normal expense:
+   * a credit card used for a purchase belongs in
+   * paymentMode, NOT toAccount.
+   */
+  if (
+    toAccount &&
+    isCreditCardAccount_(toAccount, cfg)
+  ) {
+    if (!paymentMode) {
+      paymentMode = toAccount;
+    }
+
+    toAccount = "";
+  }
+
+  const cardFromText =
+    resolveCreditCardFromText_(
+      lower,
+      cfg
+    );
+
+  if (cardFromText) {
+    paymentMode = cardFromText;
+  }
+}
 
   /*
    * 7. Investment detection.
@@ -655,31 +723,84 @@ function normalizeTransaction_(raw, cfg, now, source) {
     subcategory = investmentHit.subcategory || subcategory || "";
   }
 
-  /*
-   * 8. Payment-mode correction.
-   */
-  if (paymentMode) {
-    paymentMode = canonicalPaymentMode_(paymentMode, cfg);
-  }
-
-  /*
-   * 9. Account comes from the payment mode.
-   */
-  let account = "";
-  if (paymentMode) {
-    account = accountForPaymentMode_(paymentMode, cfg);
-  }
-
-  // Explicit account supplied by an internal integration wins over
-  // payment-mode inference. This is used by the isolated Ledgerly backend.
-  const explicitAccount = clean_(input.account);
-  if (explicitAccount) {
-    const matchedAccount = cfg.accounts.find(a =>
-      same_(a.name, explicitAccount) ||
-      (a.keywords || []).some(k => same_(k, explicitAccount))
+/*
+ * 8. Payment-mode correction.
+ *
+ * Only replace the value if canonicalization actually
+ * finds a configured payment mode.
+ *
+ * This prevents a valid value such as "UPI" from being
+ * turned into an empty string because of a configuration
+ * mismatch.
+ */
+if (paymentMode) {
+  const canonicalPaymentMode =
+    canonicalPaymentMode_(
+      paymentMode,
+      cfg
     );
-    if (matchedAccount) account = matchedAccount.name;
+
+  if (canonicalPaymentMode) {
+    paymentMode = canonicalPaymentMode;
   }
+}
+
+/*
+ * 9. ACCOUNT / SOURCE ACCOUNT
+ *
+ * For a normal transaction:
+ *   Account = account associated with payment mode
+ *
+ * For Credit Card Payment:
+ *   Account = source bank/cash account
+ *   To Account = credit card being paid
+ */
+
+let account = "";
+
+if (paymentMode) {
+  account =
+    accountForPaymentMode_(
+      paymentMode,
+      cfg
+    );
+}
+
+/*
+ * Explicit account supplied by an integration
+ * takes priority.
+ */
+const explicitAccount =
+  clean_(input.account);
+
+if (explicitAccount) {
+
+  const matchedAccount =
+    cfg.accounts.find(a =>
+      same_(a.name, explicitAccount) ||
+      (a.keywords || []).some(
+        k => same_(k, explicitAccount)
+      )
+    );
+
+  if (matchedAccount) {
+    account = matchedAccount.name;
+  }
+}
+
+/*
+ * SAFETY:
+ *
+ * A credit card being paid can NEVER also be
+ * the source account.
+ */
+if (
+  same_(type, "Credit Card Payment") &&
+  account &&
+  isCreditCardAccount_(account, cfg)
+) {
+  account = "";
+}
 
   /*
    * 10. If UPI was explicitly used but configuration does not contain
@@ -1657,10 +1778,19 @@ function resolveCreditCardDestination_(hint, text, cfg) {
 function resolvePaymentMethodFromBillText_(text, cfg) {
   const t = normalizeText_(text);
 
-  // Prefer explicit source/payment wording.
+  /*
+   * For credit-card bill payments, only inspect the portion
+   * immediately following the explicit payment-method keyword.
+   *
+   * IMPORTANT:
+   * Do not use everything until the end of the combined transaction
+   * text because buildTransactionText_() also contains:
+   * payment_mode, account, to_account and type.
+   */
+
   const patterns = [
-    /\b(?:using|via|through|from|with|by)\s+(.+)$/,
-    /\busing\s+(.+?)(?:\s+(?:yesterday|today|tomorrow|day before yesterday|\d+\s+days?\s+ago))?$/
+    /\b(?:using|via|through|from|with|by)\s+(upi|cash)\b/,
+    /\b(?:using|via|through|from|with|by)\s+([a-z0-9][a-z0-9 &_-]{0,50}?)(?=\s+(?:upi|cash|sbi credit card|icici credit card|bob credit card|hdfc credit card|credit card payment)\b|$)/
   ];
 
   for (let i = 0; i < patterns.length; i++) {
@@ -1677,12 +1807,17 @@ function resolvePaymentMethodFromBillText_(text, cfg) {
     }
   }
 
+  /*
+   * Explicit keywords are deterministic and should win.
+   */
   if (/\bupi\b/.test(t)) {
-    return canonicalPaymentMode_("UPI", cfg);
+    const result = resolvePaymentMode_("", "UPI", cfg);
+    if (result) return result;
   }
 
   if (/\bcash\b/.test(t)) {
-    return canonicalPaymentMode_("Cash", cfg);
+    const result = resolvePaymentMode_("", "Cash", cfg);
+    if (result) return result;
   }
 
   return "";
@@ -2023,7 +2158,7 @@ function getConfiguration_() {
   };
 }
 
-function invalidateConfigCache_() {
+function invalidateConfigCache() {
   CacheService.getScriptCache().remove(CACHE_KEY);
 }
 
@@ -3987,6 +4122,16 @@ function setLedgerlyBridgeSecret(secret) {
 
 function getLedgerlyBridgeSecret_() {
   const p=PropertiesService.getScriptProperties();
+  return String(
+    p.getProperty(LEDGERLY_BRIDGE.secretProperty) ||
+    p.getProperty(LEDGERLY_BRIDGE.legacySecretProperty) ||
+    ""
+  );
+}
+
+function getLedgerlyBridgeSecret() {
+  const p=PropertiesService.getScriptProperties();
+  console.log(p.getProperty(LEDGERLY_BRIDGE.secretProperty))
   return String(
     p.getProperty(LEDGERLY_BRIDGE.secretProperty) ||
     p.getProperty(LEDGERLY_BRIDGE.legacySecretProperty) ||
