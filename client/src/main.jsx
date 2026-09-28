@@ -537,37 +537,128 @@ function BankAccountEditModal({account,onClose,onSaved}){
   });
   const [saving,setSaving]=useState(false);
   const update=(key,value)=>setForm(f=>({...f,[key]:value}));
-  const submit=async e=>{
-    e.preventDefault();
-    if(!String(form.name||'').trim())return alert('Account name is required.');
-    setSaving(true);
-    try{
-      const r=await fetch(API,{
-        method:'POST',
-        headers:{'Content-Type':'text/plain;charset=utf-8'},
-        body:JSON.stringify({
-          action:'updateBankAccount',
-          account:accountName(account),
-          name:String(form.name).trim(),
-          type:String(form.type||'Bank Account').trim(),
-          currentBalance:Number(form.currentBalance||0),
-          openingBalance:Number(form.openingBalance||0),
-          openingDate:String(form.openingDate||''),
-          manualAdjustment:Number(form.manualAdjustment||0),
-          active:!!form.active,
-          notes:String(form.notes||'')
-        })
-      });
-      const next=await r.json();
-      if(!r.ok||next.success===false||next.ok===false)
-        throw new Error(next.error||next.message||'Could not update bank account.');
-      onSaved();
-    }catch(err){
-      alert(err.message||'Could not update bank account.');
-    }finally{
-      setSaving(false);
+  const submit = async e => {
+  e.preventDefault();
+
+  if (!String(form.name || '').trim()) {
+    return alert('Account name is required.');
+  }
+
+  setSaving(true);
+
+  try {
+    const payload = {
+      action: 'updateBankAccount',
+
+      // IMPORTANT:
+      // Ledgerly backend expects accountId/id.
+      accountId:
+        account.id ||
+        account.accountId ||
+        account.account ||
+        accountName(account),
+
+      id:
+        account.id ||
+        account.accountId ||
+        account.account ||
+        accountName(account),
+
+      name: String(form.name).trim(),
+      accountName: String(form.name).trim(),
+
+      type: String(
+        form.type || 'Bank Account'
+      ).trim(),
+
+      // IMPORTANT:
+      // Backend expects "balance", not "currentBalance".
+      balance: Number(form.currentBalance || 0),
+
+      // Keep these for Finance Assistant.
+      openingBalance: Number(
+        form.openingBalance || 0
+      ),
+
+      openingDate: String(
+        form.openingDate || ''
+      ),
+
+      manualAdjustment: Number(
+        form.manualAdjustment || 0
+      ),
+
+      active: !!form.active,
+
+      notes: String(
+        form.notes || ''
+      )
+    };
+
+    console.log(
+      'Updating bank account:',
+      payload
+    );
+
+    const r = await fetch(API, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/plain;charset=utf-8'
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const raw = await r.text();
+
+    console.log(
+      'Bank account update HTTP:',
+      r.status
+    );
+
+    console.log(
+      'Bank account update response:',
+      raw
+    );
+
+    let next;
+
+    try {
+      next = JSON.parse(raw);
+    } catch (_) {
+      throw new Error(
+        `Ledgerly returned a non-JSON response (HTTP ${r.status}).`
+      );
     }
-  };
+
+    if (
+      !r.ok ||
+      next.success === false ||
+      next.ok === false
+    ) {
+      throw new Error(
+        next.error ||
+        next.message ||
+        'Could not update bank account.'
+      );
+    }
+
+    onSaved();
+
+  } catch (err) {
+    console.error(
+      'Bank account update failed:',
+      err
+    );
+
+    alert(
+      err.message ||
+      'Could not update bank account.'
+    );
+
+  } finally {
+    setSaving(false);
+  }
+};
   return <div className="modal-backdrop">
     <div className="modal">
       <div className="modal-head">
