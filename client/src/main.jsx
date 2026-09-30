@@ -55,6 +55,9 @@ function cachedPortfolio_(period){
 function cachePortfolio_(period,value){
   try{localStorage.setItem('ledgerly:lastPortfolio',JSON.stringify({period,data:value,savedAt:Date.now()}));}catch(_){}
 }
+function clearPortfolioCache_(){
+  try{localStorage.removeItem('ledgerly:lastPortfolio');}catch(_){}
+}
 const periodLabels={all:'All time','this-month':'This month','last-month':'Last month','last-3-months':'Last 3 months','last-6-months':'Last 6 months','this-year':'This year'};
 
 function parseDelimited(text){
@@ -176,12 +179,16 @@ function App(){
 
   const hasUsableData=()=>!!(data&&(data.holdings?.length||data.finance||data.bankAccounts?.length));
 
-  const load=async()=>{
+  const load=async(options={})=>{
+    const force=options.force!==false;
+    if(force)clearPortfolioCache_();
     const hasData=hasUsableData();
     if(!hasData)setLoading(true);
     setError('');
     try{
-      const r=await fetch(`${API}?action=portfolio&period=${encodeURIComponent(period)}`);
+      const separator=API.includes('?')?'&':'?';
+      const cacheBust=force?`${separator}_=${Date.now()}`:'';
+      const r=await fetch(`${API}?action=portfolio&period=${encodeURIComponent(period)}${cacheBust}`,{cache:'no-store'});
       if(!r.ok)throw new Error(r.status===404?'Ledgerly Apps Script deployment was not found. Deploy the current Code.gs as a web app and update client/.env with its /exec URL.':`Ledgerly API returned ${r.status}`);
       const next=await r.json();
       if(next.success===false||next.ok===false)throw new Error(next.error||next.message||'Could not load portfolio.');
@@ -198,17 +205,11 @@ function App(){
   const refreshQuotes=async()=>{
     setRefreshing(true);
     try{
-      const r=await fetch(`${API}?action=refreshQuotes`);
+      const r=await fetch(`${API}?action=refreshQuotes&_=${Date.now()}`,{cache:'no-store'});
       const next=await r.json();
       if(!r.ok||next.success===false||next.ok===false)throw new Error(r.status===404?'Ledgerly Apps Script deployment was not found. Deploy the current Code.gs as a web app and update client/.env with its /exec URL.':next.error||'Could not refresh prices.');
-      setData(d=>({...d,
-        quotes:next.quotes||d.quotes,
-        market:next.market||d.market,
-        holdings:next.holdings||d.holdings,
-        totals:next.totals||d.totals,
-        importedHoldings:next.importedHoldings||d.importedHoldings,
-        lastQuoteRefresh:Date.now()
-      }));
+      setData(d=>({...d,quotes:next.quotes||d.quotes,market:next.market||d.market,lastQuoteRefresh:Date.now()}));
+      await load({force:true});
     }catch(e){
       setError(e.message||'Could not refresh prices.');
     }finally{
@@ -253,7 +254,7 @@ function App(){
         if(!r.ok||next.success===false||next.ok===false)throw new Error(next.error||'Mutual-fund import failed');
         mfCount=Number(next.count||imported.mutualFunds.length);
       }
-      await load();
+      await load({force:true});
       alert(`Imported ${stockCount} stock rows and ${mfCount} mutual-fund rows.`);
     }catch(error){alert(error.message||'Could not import data.')}
     e.target.value='';
@@ -288,9 +289,9 @@ function App(){
         {tab==='settings'&&<SettingsPage finance={finance} onRefresh={load}/>}
       </>}
     </main>
-    {modal&&<TransactionModal finance={finance} onClose={()=>setModal(false)} onSaved={async()=>{setModal(false);await load({silent:true});refreshQuotes()}}/>}
-    {editHolding&&<HoldingEditModal holding={editHolding} onClose={()=>setEditHolding(null)} onSaved={()=>{setEditHolding(null);load({silent:true})}}/>}
-    {editAccount&&<BankAccountEditModal account={editAccount} onClose={()=>setEditAccount(null)} onSaved={()=>{setEditAccount(null);load({silent:true})}}/>}
+    {modal&&<TransactionModal finance={finance} onClose={()=>setModal(false)} onSaved={async()=>{setModal(false);await load({force:true});refreshQuotes()}}/>}
+    {editHolding&&<HoldingEditModal holding={editHolding} onClose={()=>setEditHolding(null)} onSaved={()=>{setEditHolding(null);load({force:true})}}/>}
+    {editAccount&&<BankAccountEditModal account={editAccount} onClose={()=>setEditAccount(null)} onSaved={()=>{setEditAccount(null);load({force:true})}}/>}
   </div>
 }
 

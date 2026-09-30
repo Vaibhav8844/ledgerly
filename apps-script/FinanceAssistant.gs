@@ -256,11 +256,14 @@ function onFinanceConfigEdit(e) {
   if (!e || !e.range) return;
   const sheetName = e.range.getSheet().getName();
   if (isConfigSheet_(sheetName)) invalidateConfigCache_();
-  if (sheetName === LEDGERLY_BRIDGE.bankSheet) invalidateFinanceAnalyticsCache_();
+  if (/^\d{4}-\d{2}$/.test(sheetName)) invalidateFinanceMonthCache_(sheetName);
+  if (sheetName === LEDGERLY_BRIDGE.bankSheet || /^\d{4}-\d{2}$/.test(sheetName)) invalidateFinanceAnalyticsCache_();
 }
 
 function onFinanceConfigChange() {
   invalidateConfigCache_();
+  invalidateFinanceTransactionCaches_();
+  invalidateFinanceAnalyticsCache_();
 }
 
 function seedDefaults_() {
@@ -1037,6 +1040,13 @@ function invalidateFinanceMonthCache_(month) {
 
 function invalidateFinanceAnalyticsCache_() {
   try { CacheService.getScriptCache().remove(LEDGERLY_PERF.bankKey); } catch (_) {}
+}
+
+function invalidateFinanceTransactionCaches_() {
+  getSpreadsheet_().getSheets().forEach(sh => {
+    const name = sh.getName();
+    if (/^\d{4}-\d{2}$/.test(name)) invalidateFinanceMonthCache_(name);
+  });
 }
 
 /* =========================================================

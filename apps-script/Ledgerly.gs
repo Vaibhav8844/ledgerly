@@ -8,9 +8,13 @@
 
 const LEDGERLY_CONFIG = {
   spreadsheetId: "1nw8QpT85epAlmAmtNf3yLZ8JrM5uOb3LqHSTgukcf2Q",
-  financeApiUrlProperty: "FINANCE_ASSISTANT_API_URL",
-  financeSecretProperty: "FINANCE_ASSISTANT_API_SECRET"
+  financeApiUrlProperty: "YOUR_FINANCE_ASSISTANT_EXEC_URL",
+  financeSecretProperty: "YOUR_EXISTING_SECRET"
 };
+
+function runSetterForFinaceAssistantConnection(){
+  console.log(setFinanceAssistantConnection("https://script.google.com/macros/s/AKfycbxJsI03Hmr2FjzLxdIWOmLoMycSeb1rA3ounMdG6h-c0rpjXpmRwqueO8IUVttfVVVC/exec","tme5KlTHJGuRe3qHXN29YpbWpDtRqQbD"))
+}
 
 const LEDGERLY_PERF = {
   portfolioCacheSeconds: 15, dataCacheSeconds: 300, quoteCacheSeconds: 30,
@@ -158,6 +162,7 @@ function updateBankAccount_(input) {
     type:String(input.type || 'Bank account').trim(),
     balance:Number(input.balance || 0)
   });
+  invalidateLedgerlyCaches_();
   return {success:true,account:result.account||result.bankAccount||null};
 }
 
@@ -467,12 +472,12 @@ function updateHolding_(input){
   if(kind==='stocks'){
     const sh=getLedgerlySpreadsheet_().getSheetByName(SHEETS.stocks), values=sh&&sh.getDataRange().getValues();
     if(!sh||!input.symbol)throw new Error('Stock holding not found.');
-    for(let row=1;row<values.length;row++)if(String(values[row][0])===String(input.symbol)){sh.getRange(row+1,1,1,STOCK_HEADERS.length).setValues([[String(input.symbol),String(input.isin||''),Number(input.qty)||0,Number(input.avg)||0,Number(input.invested)||0,Number(input.ltp)||0,Number(input.value)||0,Number(input.value||0)-Number(input.invested||0)]]);return {ok:true};}
+    for(let row=1;row<values.length;row++)if(String(values[row][0])===String(input.symbol)){sh.getRange(row+1,1,1,STOCK_HEADERS.length).setValues([[String(input.symbol),String(input.isin||''),Number(input.qty)||0,Number(input.avg)||0,Number(input.invested)||0,Number(input.ltp)||0,Number(input.value)||0,Number(input.value||0)-Number(input.invested||0)]]);invalidateLedgerlyCaches_();return {ok:true};}
   }
   if(kind==='mutualFunds'){
     const sh=getLedgerlySpreadsheet_().getSheetByName(SHEETS.mutualFunds), values=sh&&sh.getDataRange().getValues();
     if(!sh||!input.schemeName)throw new Error('Mutual-fund holding not found.');
-    for(let row=1;row<values.length;row++)if(String(values[row][0])===String(input.schemeName)&&String(values[row][4]||'')===String(input.folioNo||'')){sh.getRange(row+1,1,1,MUTUAL_FUND_HEADERS.length).setValues([[String(input.schemeName),String(input.amc||''),String(input.category||''),String(input.subCategory||''),String(input.folioNo||''),String(input.source||''),Number(input.units)||0,Number(input.invested)||0,Number(input.value)||0,Number(input.value||0)-Number(input.invested||0),Number(input.xirr)||0]]);return {ok:true};}
+    for(let row=1;row<values.length;row++)if(String(values[row][0])===String(input.schemeName)&&String(values[row][4]||'')===String(input.folioNo||'')){sh.getRange(row+1,1,1,MUTUAL_FUND_HEADERS.length).setValues([[String(input.schemeName),String(input.amc||''),String(input.category||''),String(input.subCategory||''),String(input.folioNo||''),String(input.source||''),Number(input.units)||0,Number(input.invested)||0,Number(input.value)||0,Number(input.value||0)-Number(input.invested||0),Number(input.xirr)||0]]);invalidateLedgerlyCaches_();return {ok:true};}
   }
   throw new Error('Holding not found or cannot be edited.');
 }
@@ -501,10 +506,10 @@ function importMutualFunds_(rows){
 function upsertQuote_(input){
   const symbol=String(input.symbol||'').trim().toUpperCase(), price=Number(input.price); if(!symbol||!(price>0))throw new Error('Symbol and positive price are required.');
   const sh=getLedgerlySpreadsheet_().getSheetByName(SHEETS.quotes),vals=sh.getDataRange().getValues();
-  for(let r=1;r<vals.length;r++)if(String(vals[r][0]).toUpperCase()===symbol){sh.getRange(r+1,1,1,4).setValues([[symbol,price,Number(input.previousClose||vals[r][2]||0),new Date()]]);return {ok:true};}
-  sh.appendRow([symbol,price,Number(input.previousClose||0),new Date()]); return {ok:true};
+  for(let r=1;r<vals.length;r++)if(String(vals[r][0]).toUpperCase()===symbol){sh.getRange(r+1,1,1,4).setValues([[symbol,price,Number(input.previousClose||vals[r][2]||0),new Date()]]);invalidateLedgerlyCaches_();return {ok:true};}
+  sh.appendRow([symbol,price,Number(input.previousClose||0),new Date()]); invalidateLedgerlyCaches_(); return {ok:true};
 }
-function saveSnapshot_(input){const sh=getLedgerlySpreadsheet_().getSheetByName(SHEETS.snapshots);sh.appendRow([input.date||new Date(),Number(input.value||0),Number(input.invested||0),Number(input.pnl||0)]);return {ok:true};}
+function saveSnapshot_(input){const sh=getLedgerlySpreadsheet_().getSheetByName(SHEETS.snapshots);sh.appendRow([input.date||new Date(),Number(input.value||0),Number(input.invested||0),Number(input.pnl||0)]);invalidateLedgerlyCaches_();return {ok:true};}
 
 /** Refresh all currently held STOCK symbols using GoogleFinance formulas.
  * Google documents the price quote as real-time but delayed by up to 20 minutes.
