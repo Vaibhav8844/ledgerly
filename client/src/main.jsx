@@ -170,6 +170,7 @@ function App(){
     market:{open:false,label:'Market closed'},finance:null
   });
   const [modal,setModal]=useState(false);
+  const [transferModal,setTransferModal]=useState(false);
   const [editHolding,setEditHolding]=useState(null);
   const [editAccount,setEditAccount]=useState(null);
   const [loading,setLoading]=useState(!cached);
@@ -274,6 +275,7 @@ function App(){
           <PeriodSelect value={period} onChange={setPeriod}/>
           <MarketBadge market={data.market}/>
           <button className="icon-btn" title="Refresh prices" onClick={refreshQuotes} disabled={refreshing}><RefreshCw size={18} className={refreshing?'spin':''}/></button>
+          <button className="secondary" onClick={()=>setTransferModal(true)}><ArrowLeftRight size={17}/><span>Transfer cash</span></button>
           <label className="secondary import-button" title="Import stock or mutual-fund Excel, CSV or TSV"><Upload size={17}/><span>Import</span><input type="file" accept=".xlsx,.csv,.tsv" onChange={importData}/></label>
           <button className="primary add-button" onClick={()=>setModal(true)}><Plus size={18}/><span>Add investment</span></button>
         </div>
@@ -290,6 +292,7 @@ function App(){
       </>}
     </main>
     {modal&&<TransactionModal finance={finance} onClose={()=>setModal(false)} onSaved={async()=>{setModal(false);await load({force:true});refreshQuotes()}}/>}
+    {transferModal&&<TransferModal finance={finance} onClose={()=>setTransferModal(false)} onSaved={async()=>{setTransferModal(false);await load({force:true})}}/>}
     {editHolding&&<HoldingEditModal holding={editHolding} onClose={()=>setEditHolding(null)} onSaved={()=>{setEditHolding(null);load({force:true})}}/>}
     {editAccount&&<BankAccountEditModal account={editAccount} onClose={()=>setEditAccount(null)} onSaved={()=>{setEditAccount(null);load({force:true})}}/>}
   </div>
@@ -697,6 +700,26 @@ function TransactionModal({finance,onClose,onSaved}){
   const submit=async e=>{e.preventDefault();if(!form.fundingAccount)return alert('Select the bank account used for this investment.');setSaving(true);try{const r=await fetch(API,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({action:'transaction',...form})});const next=await r.json();if(!r.ok||next.success===false||next.ok===false)throw new Error(next.error||'Could not save transaction');onSaved()}catch(err){alert(err.message||'Could not save transaction')}finally{setSaving(false)}};
   const total=Number(form.quantity||0)*Number(form.price||0)+Number(form.charges||0);
   return <div className="modal-backdrop"><div className="modal"><div className="modal-head"><div><span className="eyebrow">INVESTMENT CASH FLOW</span><h2>Add investment transaction</h2></div><button className="icon-btn" onClick={onClose}><X/></button></div><form onSubmit={submit}><div className="seg"><button type="button" className={form.type==='BUY'?'on':''} onClick={()=>update('type','BUY')}>Buy</button><button type="button" className={form.type==='SELL'?'on':''} onClick={()=>update('type','SELL')}>Sell</button></div><div className="form-grid"><label>Asset type<select value={form.assetType} onChange={e=>update('assetType',e.target.value)}><option value="STOCK">Stock</option><option value="MF">Mutual fund</option></select></label><label>Symbol / scheme<input required placeholder="e.g. RELIANCE" value={form.symbol} onChange={e=>update('symbol',e.target.value.toUpperCase())}/></label><label>Date<input required type="date" value={form.date} onChange={e=>update('date',e.target.value)}/></label><label>Quantity<input required min="0.000001" step="any" type="number" value={form.quantity} onChange={e=>update('quantity',e.target.value)}/></label><label>Traded price / NAV<input required min="0" step="any" type="number" value={form.price} onChange={e=>update('price',e.target.value)}/></label><label>Brokerage + charges<input min="0" step="any" type="number" value={form.charges} onChange={e=>update('charges',e.target.value)}/></label><label>Pay from / receive into<select required value={form.fundingAccount} onChange={e=>update('fundingAccount',e.target.value)}><option value="">Select account</option>{accounts.map(a=><option key={accountName(a)} value={accountName(a)}>{accountName(a)}</option>)}</select></label><label>Note<input placeholder="Optional" value={form.note} onChange={e=>update('note',e.target.value)}/></label></div><div className="cash-impact"><span>{form.type==='BUY'?'Cash outflow':'Cash inflow'}</span><b>{money(total)}</b><small>{form.fundingAccount?'Finance Assistant will receive the cash-flow entry for this account.':'Select an account to link cash flow.'}</small></div><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Cancel</button><button className="primary" disabled={saving}>{saving?'Saving…':'Save transaction'}</button></div></form></div></div>
+}
+
+function TransferModal({finance,onClose,onSaved}){
+  const accounts=safeArray(finance.bankAccounts);
+  const [form,setForm]=useState({fromAccount:'',toAccount:'',amount:'',date:new Date().toISOString().slice(0,10),note:''});
+  const [saving,setSaving]=useState(false);
+  const update=(key,value)=>setForm(current=>({...current,[key]:value}));
+  const submit=async event=>{
+    event.preventDefault();
+    if(!form.fromAccount||!form.toAccount)return alert('Select both source and destination accounts.');
+    if(form.fromAccount===form.toAccount)return alert('Source and destination accounts must be different.');
+    setSaving(true);
+    try{
+      const response=await fetch(API,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({action:'transfer',...form})});
+      const result=await response.json();
+      if(!response.ok||result.success===false||result.ok===false)throw new Error(result.error||result.message||'Could not create transfer');
+      onSaved();
+    }catch(error){alert(error.message||'Could not create transfer')}finally{setSaving(false)}
+  };
+  return <div className="modal-backdrop"><div className="modal"><div className="modal-head"><div><span className="eyebrow">CASH MOVEMENT</span><h2>Transfer cash</h2></div><button className="icon-btn" onClick={onClose} aria-label="Close"><X/></button></div><form onSubmit={submit}><div className="form-grid"><label>From account<select required value={form.fromAccount} onChange={e=>update('fromAccount',e.target.value)}><option value="">Select account</option>{accounts.map(account=><option key={`from-${accountName(account)}`} value={accountName(account)}>{accountName(account)}</option>)}</select></label><label>To account<select required value={form.toAccount} onChange={e=>update('toAccount',e.target.value)}><option value="">Select account</option>{accounts.map(account=><option key={`to-${accountName(account)}`} value={accountName(account)}>{accountName(account)}</option>)}</select></label><label>Amount<input required min="0.01" step="any" type="number" value={form.amount} onChange={e=>update('amount',e.target.value)}/></label><label>Date<input required type="date" value={form.date} onChange={e=>update('date',e.target.value)}/></label><label>Note<input placeholder="e.g. Fund broker wallet" value={form.note} onChange={e=>update('note',e.target.value)}/></label></div><div className="feed-note"><ArrowLeftRight size={15}/><span>This moves cash between accounts. It is not counted as spending or investment.</span></div><div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Cancel</button><button className="primary" disabled={saving}>{saving?'Saving...':'Save transfer'}</button></div></form></div></div>
 }
 
 function Empty({icon,title,text}){return <div className="empty">{icon&&<div className="empty-icon">{icon}</div>}<h3>{title}</h3><p>{text}</p></div>}

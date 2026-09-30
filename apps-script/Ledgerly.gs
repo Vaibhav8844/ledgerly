@@ -128,6 +128,7 @@ function handle_(e, method) {
     else if (action === 'marketStatus') result = getMarketStatus_();
     else if (action === 'refreshQuotes') result = refreshLiveQuotes_();
     else if (action === 'transaction') result = addTransaction_(body);
+    else if (action === 'transfer') result = transferCash_(body);
     else if (action === 'deleteTransaction') result = deleteTransaction_(body.id || params.id);
     else if (action === 'quote') result = upsertQuote_(body);
     else if (action === 'snapshot') result = saveSnapshot_(body);
@@ -164,6 +165,26 @@ function updateBankAccount_(input) {
   });
   invalidateLedgerlyCaches_();
   return {success:true,account:result.account||result.bankAccount||null};
+}
+
+function transferCash_(input) {
+  const fromAccount = String(input.fromAccount || input.account || '').trim();
+  const toAccount = String(input.toAccount || input.destinationAccount || '').trim();
+  const amount = Number(input.amount);
+  const date = String(input.date || '').trim();
+  if (!(amount > 0) || !date || !fromAccount || !toAccount) {
+    throw new Error('Transfer requires source, destination, amount and date.');
+  }
+  const result = callFinanceAssistant_({
+    action: 'ledgerlyTransfer',
+    fromAccount,
+    toAccount,
+    amount,
+    date,
+    remarks: String(input.remarks || input.note || 'Ledgerly cash transfer')
+  });
+  invalidateLedgerlyCaches_();
+  return {success:true,financeTransactionId:result.financeTransactionId||null};
 }
 
 function testLedgerlyFinanceConnection() {

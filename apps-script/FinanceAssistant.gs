@@ -4161,6 +4161,7 @@ function handleLedgerlyBridgePost_(body) {
   const allowed = [
     "ledgerlyDashboardData",
     "ledgerlyCashFlow",
+    "ledgerlyTransfer",
     "ledgerlyDeleteFinanceTransaction",
     "ledgerlyUpdateBankAccount"
   ];
@@ -4175,6 +4176,10 @@ function handleLedgerlyBridgePost_(body) {
 
   if (action === "ledgerlyCashFlow") {
     return addLedgerlyCashFlow_(body);
+  }
+
+  if (action === "ledgerlyTransfer") {
+    return addLedgerlyTransfer_(body);
   }
 
   if (action === "ledgerlyDeleteFinanceTransaction") {
@@ -4305,6 +4310,43 @@ function addLedgerlyCashFlow_(body) {
     throw new Error(result && result.message ? result.message : "Finance transaction was not created.");
   }
 
+  return { success: true, financeTransactionId: added.id };
+}
+
+function addLedgerlyTransfer_(body) {
+  const fromAccount = String(body.fromAccount || body.account || "").trim();
+  const toAccount = String(body.toAccount || body.destinationAccount || "").trim();
+  const amount = Number(body.amount);
+  const date = String(body.date || "").trim();
+  if (!(amount > 0) || !date || !fromAccount || !toAccount) {
+    throw new Error("Transfer requires a positive amount, date, source account and destination account.");
+  }
+  if (same_(fromAccount, toAccount)) {
+    throw new Error("Source and destination accounts must be different.");
+  }
+
+  const cfg = getConfig_();
+  [fromAccount, toAccount].forEach(name => {
+    const account = cfg.accounts.find(a => same_(a.name, name));
+    if (!account || !account.active || !same_(account.type, "Bank Account")) {
+      throw new Error("Transfer account is not configured as an active Finance Assistant bank account: " + name);
+    }
+  });
+
+  const result = addTransactions_([{
+    date,
+    amount,
+    type: "Transfer",
+    category: "Other",
+    account: fromAccount,
+    to_account: toAccount,
+    merchant: "Account transfer",
+    remarks: String(body.remarks || "Ledgerly cash transfer"),
+    tags: "Ledgerly",
+    source: "Ledgerly"
+  }], "Ledgerly");
+  const added = result && result.results ? result.results.find(r => r.status === "added") : null;
+  if (!added) throw new Error(result && result.message ? result.message : "Transfer was not created.");
   return { success: true, financeTransactionId: added.id };
 }
 
